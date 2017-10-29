@@ -23,7 +23,7 @@
 
 static int net_id = 0;
 static int offset = 2;
-static int traffic = 1;
+static int traffic = 4;
 static double arrival_time = 1000.0;
 static double load = 0.0;	//Percent utilization of terminal uplink
 static double MEAN_INTERVAL = 0.0;
@@ -73,7 +73,8 @@ enum TRAFFIC
 {
 	UNIFORM = 1, /* sends message to a randomly selected node */
 	NEAREST_GROUP = 2, /* sends message to the node connected to the neighboring router */
-	NEAREST_NEIGHBOR = 3 /* sends message to the next node (potentially connected to the same router) */
+	NEAREST_NEIGHBOR = 3, /* sends message to the next node (potentially connected to the same router) */
+        RANK_ZERO = 4 /* Send all traffic to rank 0 */
 };
 
 struct svr_state
@@ -171,7 +172,7 @@ void ft_svr_register_model_stats()
 const tw_optdef app_opt [] =
 {
         TWOPT_GROUP("Model net synthetic traffic " ),
-	TWOPT_UINT("traffic", traffic, "UNIFORM RANDOM=1, NEAREST NEIGHBOR=2 "),
+	TWOPT_UINT("traffic", traffic, "UNIFORM RANDOM=1, NEAREST NEIGHBOR=2"),
 	TWOPT_STIME("arrival_time", arrival_time, "INTER-ARRIVAL TIME"),
         TWOPT_STIME("load", load, "percentage of terminal link bandiwdth to inject packets"),
         TWOPT_END()
@@ -285,6 +286,10 @@ static void handle_kickoff_event(
    if(traffic == UNIFORM)
    {
    	local_dest = tw_rand_integer(lp->rng, 0, num_nodes - 1);
+   }
+   if (traffic == RANK_ZERO)
+   {
+       local_dest = 0;
    }
 
    assert(local_dest < LLU(num_nodes));
