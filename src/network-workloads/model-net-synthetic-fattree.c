@@ -17,13 +17,13 @@
 #include "codes/configuration.h"
 #include "codes/lp-type-lookup.h"
 
-#define PAYLOAD_SZ 512
+#define PAYLOAD_SZ (512*256)
 
 #define PARAMS_LOG 1
 
 static int net_id = 0;
 static int offset = 2;
-static int traffic = 4;
+static int traffic = 1;
 static double arrival_time = 1000.0;
 static double load = 0.0;	//Percent utilization of terminal uplink
 static double MEAN_INTERVAL = 0.0;
@@ -36,6 +36,7 @@ static int num_nodes_per_grp = 0;
 
 static int num_groups = 0;
 static int num_nodes = 0;
+static int num_msgs = 20;
 
 typedef struct svr_msg svr_msg;
 typedef struct svr_state svr_state;
@@ -44,6 +45,7 @@ typedef struct svr_state svr_state;
 static char group_name[MAX_NAME_LENGTH];
 static char lp_type_name[MAX_NAME_LENGTH];
 static int group_index, lp_type_index, rep_id, offset;
+
 
 /* convert GiB/s and bytes to ns */
  static tw_stime bytes_to_ns(uint64_t bytes, double GB_p_s)
@@ -65,17 +67,18 @@ enum svr_event
 {
     KICKOFF,	   /* kickoff event */
     REMOTE,        /* remote event */
-    LOCAL      /* local event */
+    LOCAL,      /* local event */
+    ACK         /* event sent when remote endpoint has received message */
 };
-
 /* type of synthetic traffic */
 enum TRAFFIC
 {
 	UNIFORM = 1, /* sends message to a randomly selected node */
     BISECTION = 2, /* sends messages to node established in bisection pairing*/
-	NEAREST_GROUP = 3, /* sends message to the node connected to the neighboring router */
-	NEAREST_NEIGHBOR = 4, /* sends message to the next node (potentially connected to the same router) */
-        RANK_ZERO = 5 /* Send all traffic to rank 0 */
+        RANK_ZERO = 3, /* Send all traffic to rank 0 */
+        PFISTER = 4, /* A combination of UNIFORM and RANK_ZERO */
+        GRID = 5 /* breaks into a cartesian grid and sends to 4 neighbors */
+
 };
 
 struct svr_state
@@ -85,6 +88,7 @@ struct svr_state
     int local_recvd_count; /* number of local messages received */
     tw_stime start_ts;    /* time that we started sending requests */
     tw_stime end_ts;      /* time that we ended sending requests */
+    int recv_per_round;   /* In GRID, expected messages received per round */ 
 };
 
 struct svr_msg
@@ -95,6 +99,16 @@ struct svr_msg
     model_net_event_return event_rc;
 };
 
+struct {
+    int n1; /* The width of the grid */
+    int n2; /* The width of each sub-block of the grid */
+    int n3; /* The height of each sub-block of the grid */
+} cart_info = {0};
+static void rowmaj_lintoxy(int lin_id, int* outx, int* outy) ;
+static void blocked_lintoxy(int lin_id, int* outx, int* outy) ;
+static int rowmaj_xytolin(int x, int y) ;
+static int blocked_xytolin(int x, int y) ;
+ 
 static void svr_init(
     svr_state * ns,
     tw_lp * lp);
@@ -173,7 +187,8 @@ void ft_svr_register_model_stats()
 const tw_optdef app_opt [] =
 {
         TWOPT_GROUP("Model net synthetic traffic " ),
-	TWOPT_UINT("traffic", traffic, "UNIFORM RANDOM=1, BISECTION=2 "),
+	TWOPT_UINT("traffic", traffic, "UNIFORM RANDOM=1, BISECTION=2, TO_RANK_0=3, PFISTER=4, GRID=5. Add 1000 to 4, 5 for a different mapping."),
+    	TWOPT_UINT("num_messages", num_msgs, "Number of messages to be generated per terminal "),
 	TWOPT_STIME("arrival_time", arrival_time, "INTER-ARRIVAL TIME"),
         TWOPT_STIME("load", load, "percentage of terminal link bandiwdth to inject packets"),
         TWOPT_END()
@@ -243,7 +258,31 @@ static void svr_init(
 {
     ns->start_ts = 0.0;
 
-    issue_event(ns, lp);
+    if (traffic % 1000 == GRID) {
+        int recv_per_round = 4;
+        int local_id = codes_mapping_get_lp_relative_id(lp->gid, 0, 0);
+        int curx, cury;
+        switch(traffic/1000) {
+            case 0:
+                rowmaj_lintoxy(local_id, &curx, &cury);
+                break;
+            case 1:
+                blocked_lintoxy(local_id, &curx, &cury);
+                break;
+        }
+        // Unsigned distances to the 4 boundaries
+        int distances[] = {curx, cart_info.n1 - 1 - curx, cury, num_nodes/cart_info.n1 - 1 - cury};
+        for (int j = 0; j < 4; j++) {
+            if (distances[j] == 0)
+                recv_per_round--;
+            else if (distances[j] == 1)
+                recv_per_round++;
+        }
+        ns->recv_per_round = recv_per_round;
+    }
+
+    for (int j = 0; j < 4; j++)
+        issue_event(ns, lp);
     return;
 }
 
@@ -259,6 +298,28 @@ static void handle_kickoff_rev_event(
 	model_net_event_rc2(lp, &m->event_rc);
     tw_rand_reverse_unif(lp->rng);
 }	
+static void rowmaj_lintoxy(int lin_id, int* outx, int* outy) {
+    *outx = lin_id / (num_nodes / cart_info.n1);
+    *outy = lin_id % (num_nodes / cart_info.n1);
+}
+static void blocked_lintoxy(int lin_id, int* outx, int* outy) {
+    int lin_blockn = lin_id / (cart_info.n2*cart_info.n3);
+    *outx = (lin_blockn % (cart_info.n1/cart_info.n2)) * cart_info.n2;
+    *outy = lin_blockn / (cart_info.n1/cart_info.n2) * cart_info.n3;
+    int block_off = lin_id % (cart_info.n2*cart_info.n3);
+    *outx += block_off / cart_info.n3;
+    *outy += block_off % cart_info.n3;
+}
+static int rowmaj_xytolin(int x, int y) {
+    return x * (num_nodes / cart_info.n1) + y;
+}
+static int blocked_xytolin(int x, int y) {
+    int blockx = x/cart_info.n2;
+    int blocky = y/cart_info.n3;
+    int lin_blockn = blockx + blocky * cart_info.n1/cart_info.n2;
+    int lin_block_off = (x % cart_info.n2)*cart_info.n3 + (y % cart_info.n3);
+    return lin_blockn * cart_info.n2 * cart_info.n3 + lin_block_off;
+}
 static void handle_kickoff_event(
 	    svr_state * ns,
 	    tw_bf * b,
@@ -270,6 +331,16 @@ static void handle_kickoff_event(
 //    char* anno;
     char anno[MAX_NAME_LENGTH];
     tw_lpid local_dest = -1, global_dest = -1;
+
+    if(ns->msg_sent_count >= num_msgs)
+    {
+        m->incremented_flag = 1;
+        return;
+    }
+
+    m->incremented_flag = 0;
+   codes_mapping_get_lp_info(lp->gid, group_name, &group_index, lp_type_name, &lp_type_index, anno, &rep_id, &offset);
+   int local_id = codes_mapping_get_lp_relative_id(lp->gid, 0, 0);
    
     svr_msg * m_local = malloc(sizeof(svr_msg));
     svr_msg * m_remote = malloc(sizeof(svr_msg));
@@ -282,30 +353,108 @@ static void handle_kickoff_event(
 
     ns->start_ts = tw_now(lp);
 
-   codes_mapping_get_lp_info(lp->gid, group_name, &group_index, lp_type_name, &lp_type_index, anno, &rep_id, &offset);
-   int local_id = codes_mapping_get_lp_relative_id(lp->gid, 0, 0);
-   /* in case of uniform random traffic, send to a random destination. */
-   if(traffic == UNIFORM)
-   {
-   	local_dest = tw_rand_integer(lp->rng, 0, num_nodes - 1);
-   }
-   if (traffic == RANK_ZERO)
-   {
-       local_dest = 0;
-   if(traffic == BISECTION)
-   {
-        local_dest = (local_id + num_nodes/2) % num_nodes;
-   }
+    switch(traffic % 1000) {
+        case UNIFORM:
+            {
+                /* in case of uniform random traffic, send to a random destination. */
+                local_dest = tw_rand_integer(lp->rng, 0, num_nodes - 1);
+            }
+            break;
+        case RANK_ZERO:
+            {
+                if (local_id != 0)
+                    local_dest = 0;
+                else {
+                    // Rank 0 doesn't send
+                    free(m_local);
+                    free(m_remote);
+                    return;
+                }
+            }
+            break;
+        case BISECTION:
+            {
+                local_dest = (local_id + num_nodes/2) % num_nodes;
+            }
+            break;
+        case PFISTER:
+            {
+                bool in_set; // Part of the 20% of ranks that contribute to congestion?
+                if (traffic / 1000 == 0) {
+                    local_dest = num_nodes/5 + 1 + tw_rand_integer(lp->rng, 0, 4*num_nodes/5 - 1);
+                    in_set = local_id > 0 && local_id <= 712;
+                } else {
+                    int rand = tw_rand_integer(lp->rng, 0, 4*num_nodes/5 - 1);
+                    local_dest = 5*(rand/4);
+                    if (rand % 4 > 0)
+                        local_dest += 1 + (rand % 4);
+                    in_set = local_id % 5 == 1;
+                }
+                if ((tw_rand_integer(lp->rng, 0, 4) != 0) && in_set)
+                {
+                    local_dest =  0;
+                }
+            }
+            break;
+        case GRID: 
+            {
+                int curx, cury;
+                switch(traffic/1000) {
+                    case 0:
+                        rowmaj_lintoxy(local_id, &curx, &cury);
+                        break;
+                    case 1:
+                        blocked_lintoxy(local_id, &curx, &cury);
+                        break;
+                }
+                int destx, desty;
+                int direction = tw_rand_integer(lp->rng, 0, 3);
+                direction = (ns->msg_sent_count) % 4;
+                if (direction < 2) {
+                    destx = curx + 2*direction - 1;
+                    desty = cury;
+                }
+                else {
+                    desty = cury + 2*direction - 5;
+                    destx = curx;
+                }
+
+                /* if (destx < 0 || desty < 0 || destx >= cart_info.n1 || desty >= num_nodes / cart_info.n1) {
+                   free(m_local);
+                   free(m_remote);
+                   return;
+                   }*/
+                if (destx < 0)
+                    destx *= -1;
+                if (desty < 0)
+                    desty *= -1;
+                if (destx >= cart_info.n1)
+                    destx = 2*(cart_info.n1 - 1) - destx;
+                if (desty >= num_nodes/cart_info.n1)
+                    desty = 2*(num_nodes/cart_info.n1 - 1) - desty;
+                switch(traffic/1000) {
+                    case 0:
+                        local_dest = rowmaj_xytolin(destx, desty);
+                        break;
+                    case 1:
+                        local_dest = blocked_xytolin(destx, desty);
+                        break;
+                }
+            }
+            break;
+    }
+   // printf("Sending from %d to %ld\n", local_id, local_dest);
 
    assert(local_dest < LLU(num_nodes));
 
    global_dest = codes_mapping_get_lpid_from_relative(local_dest, group_name, lp_type_name, NULL, 0);
 
-   //printf("global_src:%d, local_src:%d, global_dest:%d, local_dest:%d num_nodes:%d \n",(int)lp->gid, local_id, (int)global_dest,(int)local_dest, num_nodes);
+   // printf("global_src:%d, local_src:%d, global_dest:%d, local_dest:%d num_nodes:%d \n",(int)lp->gid, local_id, (int)global_dest,(int)local_dest, num_nodes);
 
    // If Destination is self, then generate new destination
    if((int)global_dest == (int)lp->gid)
    {
+       // printf("Destination was self. Regenerating\n");
        local_dest = (local_dest+1) % (num_nodes-1);
        global_dest = codes_mapping_get_lpid_from_relative(local_dest, group_name, lp_type_name, NULL, 0);
    }
@@ -315,8 +464,8 @@ static void handle_kickoff_event(
    model_net_event(net_id, "test", global_dest, PAYLOAD_SZ, 0.0, sizeof(svr_msg), (const void*)m_remote, sizeof(svr_msg), (const void*)m_local, lp);
 
    //printf("LP:%d localID:%d Here\n",(int)lp->gid, (int)local_dest);
-   issue_event(ns, lp);
    //printf("Just Checking net_id:%d\n",net_id);
+   // issue_event(ns, lp);
    return;
 }
 
@@ -341,7 +490,45 @@ static void handle_remote_event(
     (void)b;
     (void)m;
     (void)lp;
-	ns->msg_recvd_count++;
+    ns->msg_recvd_count++;
+
+    if (traffic % 1000 == GRID) {
+        if (ns->msg_recvd_count % ns->recv_per_round == 0) {
+        printf("Node %d finished round %d at time %f\n", codes_mapping_get_lp_relative_id(lp->gid, 0, 0), ns->msg_recvd_count / ns->recv_per_round, tw_now(lp));
+            for (int i = 0; i < 4; i++)
+                issue_event(ns, lp);
+        }
+    } 
+    else {
+        tw_event *e;
+        e = tw_event_new(m->src, .01, lp);
+        svr_msg * ma = tw_event_data(e);
+        ma->svr_event_type = ACK;
+        tw_event_send(e);
+    }
+}
+static void handle_ack_rev_event(
+	    svr_state * ns,
+	    tw_bf * b,
+	    svr_msg * m,
+	    tw_lp * lp)
+{
+    (void)b;
+    (void)m;
+    (void)lp;
+    printf("How do I handle this reverse event??!\n");
+    assert(0);
+}
+static void handle_ack_event(
+	    svr_state * ns,
+	    tw_bf * b,
+	    svr_msg * m,
+	    tw_lp * lp)
+{
+    (void)b;
+    (void)m;
+    (void)lp;
+   issue_event(ns, lp);
 }
 
 static void handle_local_rev_event(
@@ -396,6 +583,9 @@ static void svr_rev_event(
 	case KICKOFF:
 		handle_kickoff_rev_event(ns, b, m, lp);
 		break;
+	case ACK:
+		handle_ack_rev_event(ns, b, m, lp);
+		break;
 	default:
 		assert(0);
 		break;
@@ -419,6 +609,9 @@ static void svr_event(
 	case KICKOFF:
 	    handle_kickoff_event(ns, b, m, lp);
 	    break;
+        case ACK:
+            handle_ack_event(ns, b, m, lp);
+            break;
         default:
             printf("\n LP: %d has received invalid message from src lpID: %d of message type:%d", (int)lp->gid, (int)m->src, m->svr_event_type);
             assert(0);
@@ -488,6 +681,16 @@ int main(
     num_nodes = codes_mapping_get_lp_count("MODELNET_GRP", 0, "server", NULL, 1);
 
     printf("num_nodes:%d \n",num_nodes);
+
+    cart_info.n1 = (int) sqrt(num_nodes);
+    while (num_nodes % cart_info.n1 > 0)
+        cart_info.n1++;
+    // TODO: Don't hardcode this
+    if (num_nodes == 3564) {
+        cart_info.n2 = 3;
+        cart_info.n3 = 6;
+    }
+
 
     if(lp_io_prepare("modelnet-test", LP_IO_UNIQ_SUFFIX, &handle, MPI_COMM_WORLD) < 0)
     {
