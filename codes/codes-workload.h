@@ -19,6 +19,9 @@ extern "C" {
 #include <ross.h>
 #include "configuration.h"
 
+#ifdef USE_ONLINE
+#include <abt.h>
+#endif
 #define MAX_NAME_LENGTH_WKLD 512
 
 /* implementations included with codes */
@@ -30,6 +33,7 @@ typedef struct recorder_params recorder_params;
 /* struct to hold the actual data from a single MPI event*/
 typedef struct dumpi_trace_params dumpi_trace_params;
 typedef struct checkpoint_wrkld_params checkpoint_wrkld_params;
+typedef struct online_comm_params online_comm_params;
 
 struct iomock_params
 {
@@ -57,7 +61,7 @@ struct iolang_params
 struct darshan_params
 {
     char log_file_path[MAX_NAME_LENGTH_WKLD];
-    int64_t aggregator_cnt;
+    int app_cnt;
 };
 
 struct recorder_params
@@ -77,6 +81,11 @@ struct dumpi_trace_params {
 #endif
 };
 
+struct online_comm_params {
+    char workload_name[MAX_NAME_LENGTH_WKLD];
+    char file_path[MAX_NAME_LENGTH_WKLD];
+    int nprocs;
+};
 struct checkpoint_wrkld_params
 {
     int nprocs; /* number of workload processes */
@@ -146,7 +155,24 @@ enum codes_workload_op_type
 
     /* for workloads that have events not yet handled
      * (eg the workload language) */
-    CODES_WK_IGNORE
+    CODES_WK_IGNORE, 
+
+    /* extended IO workload operations: MPI */
+
+    /* open */
+    CODES_WK_MPI_OPEN,
+    /* close */
+    CODES_WK_MPI_CLOSE,
+    /* write */
+    CODES_WK_MPI_WRITE,
+    /* read */
+    CODES_WK_MPI_READ,
+    /* collective open */
+    CODES_WK_MPI_COLL_OPEN,
+    /* collective_write */
+    CODES_WK_MPI_COLL_WRITE,
+    /* collective_read */
+    CODES_WK_MPI_COLL_READ,
 };
 
 /* I/O operation paramaters */
@@ -157,7 +183,7 @@ struct codes_workload_op
      */
 
     /* what type of operation this is */
-    int op_type;
+    enum codes_workload_op_type op_type;
     /* currently only used by network workloads */
     double start_time;
     double end_time;
@@ -218,14 +244,14 @@ struct codes_workload_op
         } collective;
         struct {
             int count;
-            unsigned int* req_ids;
+            uint32_t* req_ids;
         } waits;
         struct {
-            unsigned int req_id;
+            uint32_t req_id;
         } wait;
         struct
         {
-            unsigned int req_id;
+            uint32_t req_id;
         }
         free;
     }u;
@@ -306,12 +332,24 @@ int codes_workload_get_rank_cnt(
         const char* params,
         int app_id);
 
+/* Finalize the workload */
+int codes_workload_finalize(
+        const char* type,
+        const char* params,
+        int app_id, 
+        int rank);
+
 /* for debugging/logging: print an individual operation to the specified file */
 void codes_workload_print_op(
         FILE *f,
         struct codes_workload_op *op,
         int app_id,
         int rank);
+
+int codes_workload_get_time(const char *type,
+		const char * params,
+		int app_id,
+		int rank, double *read_time, double *write_time, int64_t *read_bytes, int64_t *written_bytes);
 
 /* implementation structure */
 struct codes_workload_method
@@ -324,6 +362,9 @@ struct codes_workload_method
     void (*codes_workload_get_next)(int app_id, int rank, struct codes_workload_op *op);
     void (*codes_workload_get_next_rc2)(int app_id, int rank);
     int (*codes_workload_get_rank_cnt)(const char* params, int app_id);
+    int (*codes_workload_finalize)(const char* params, int app_id, int rank);
+    /* added for get all read or write time */
+    int (*codes_workload_get_time)(const char * params, int app_id, int rank, double *read_time, double *write_time, int64_t *read_bytes, int64_t *written_bytes);
 };
 
 

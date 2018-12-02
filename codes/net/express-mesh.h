@@ -4,6 +4,7 @@
  *
  */
 
+//CHANGE: modify to match you header file name
 #ifndef EXPRESS_MESH_H
 #define EXPRESS_MESH_H
 
@@ -13,76 +14,67 @@ extern "C" {
 
 #include <ross.h>
 
+//CHANGE: modify to match the struct
+typedef struct net_message net_message;
+
+//CHANGE: modify the struct name - add to message_list union in common-net.h
 typedef struct em_message em_message;
 
 struct em_message
 {
-  /* magic number */
-  int magic;
-  /* flit travel start time*/
-  tw_stime travel_start_time;
- /* packet ID of the flit  */
-  unsigned long long packet_ID;
-  /* event type of the flit */
-  short  type;
-  /* category: comes from codes */
-  char category[CATEGORY_NAME_MAX];
+  //common entries:
+  int magic; /* magic number */
+  short  type; /* event type of the flit */
 
-  /* final destination LP ID, this comes from codes can be a server or any other LP type*/
-  tw_lpid final_dest_gid;
-  /*sending LP ID from CODES, can be a server or any other LP type */
-  tw_lpid sender_lp;
-  tw_lpid sender_mn_lp; // source modelnet id
- /* destination terminal ID */
-  tw_lpid dest_terminal_id;
-  int dest_terminal;
-  /* source terminal ID */
-  tw_lpid src_terminal_id;
+  tw_stime travel_start_time; /* flit travel start time*/
+  unsigned long long packet_ID; /* packet ID of the flit  */
+  char category[CATEGORY_NAME_MAX]; /* category: comes from codes */
 
-  short saved_channel;
-  short my_N_hop;
-  short hops[8];
+  tw_lpid final_dest_gid; /* final destination LP ID, this comes from codes can be a server or any other LP type*/
+  tw_lpid sender_lp; /*sending LP ID from CODES, can be a server or any other LP type */
+  tw_lpid sender_mn_lp; // source modelnet id (think NIC)
+  tw_lpid src_terminal_id; /* source terminal ID - mostly same as sender_mn_lp */
+  tw_lpid dest_terminal_id; /* destination modelnet id */
+  int dest_terminal; /* logical id of destination modelnet id */
 
-  /* Intermediate LP ID from which this message is coming */
-  unsigned int intm_lp_id;
-  short saved_vc;
-  short dim_change;
-  /* last hop of the message, can be a terminal, local router or global router */
-  int last_hop;
-  /* For routing */
-  uint64_t chunk_id;
-  uint64_t packet_size;
-  uint64_t message_id;
-  uint64_t total_size;
-
-  int saved_remote_esize;
-  int remote_event_size_bytes;
-  int local_event_size_bytes;
-
-  // For buffer message
-  int vc_index;
-  int output_chan;
-  model_net_event_return event_rc;
+  /* packet/message identifier and status */
+  uint64_t chunk_id; //which chunk of packet I am
+  uint64_t packet_size; //what is the size of my packet
+  uint64_t message_id; //seq number at message level - NIC specified
+  uint64_t total_size; //total size of the message
+  int remote_event_size_bytes; // data size for target event at destination
+  int local_event_size_bytes; // data size for event at source
   int is_pull;
   uint64_t pull_size;
+  tw_stime msg_start_time;
 
-  /* for reverse computation */   
+  //info for path traversal
+  short my_N_hop; /* hops traversed so far */
+  short hops[8]; /* can be used for storing different types of hops */
+  unsigned int intm_lp_id; /* Intermediate LP ID that sent this packet */
+  int last_hop; /* last hop of the message, can be a terminal, local router or global router */
+  int vc_index; /* stores port info */
+  int output_chan; /* virtual channel within port */
+
+  //info for reverse computation
+  short saved_channel;
+  short saved_vc;
+  model_net_event_return event_rc;
   tw_stime saved_available_time;
   tw_stime saved_avg_time;
   tw_stime saved_rcv_time;
-  tw_stime saved_busy_time; 
+  tw_stime saved_busy_time;
   tw_stime saved_total_time;
   tw_stime saved_hist_start_time;
   tw_stime saved_sample_time;
-  tw_stime msg_start_time;
 
-  int saved_hist_num;
-  int saved_occupancy;
+  //CHANGE: info for specific networks
+  short dim_change;
 };
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif 
+#endif
 

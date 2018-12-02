@@ -16,6 +16,7 @@ static darshan_params d_params = {"", 0};
 static iolang_params i_params = {0, 0, "", ""};
 static recorder_params r_params = {"", 0};
 static dumpi_trace_params du_params = {"", 0};
+static online_comm_params oc_params = {"", "", 0};
 static checkpoint_wrkld_params c_params = {0, 0, 0, 0, 0};
 static iomock_params im_params = {0, 0, 1, 0, 0, 0};
 static int n = -1;
@@ -27,12 +28,12 @@ static struct option long_opts[] =
     {"num-ranks", required_argument, NULL, 'n'},
     {"start-rank", required_argument, NULL, 'r'},
     {"d-log", required_argument, NULL, 'l'},
-    {"d-aggregator-cnt", required_argument, NULL, 'a'},
     {"i-meta", required_argument, NULL, 'm'},
     {"i-use-relpath", no_argument, NULL, 'p'},
     {"r-trace-dir", required_argument, NULL, 'd'},
     {"r-nprocs", required_argument, NULL, 'x'},
     {"dumpi-log", required_argument, NULL, 'w'},
+    {"workload-name", required_argument, NULL, 'b'},
     {"chkpoint-size", required_argument, NULL, 'S'},
     {"chkpoint-bw", required_argument, NULL, 'B'},
     {"chkpoint-iters", required_argument, NULL, 'i'},
@@ -53,7 +54,6 @@ void usage(){
             "-s: print final workload stats\n"
             "DARSHAN OPTIONS (darshan_io_workload)\n"
             "--d-log: darshan log file\n"
-            "--d-aggregator-cnt: number of aggregators for collective I/O in darshan\n"
             "IOLANG OPTIONS (iolang_workload)\n"
             "--i-meta: i/o language kernel meta file path\n"
             "--i-use-relpath: use i/o kernel path relative meta file path\n"
@@ -62,6 +62,8 @@ void usage(){
             "--r-nprocs: number of ranks in original recorder workload\n"
             "DUMPI TRACE OPTIONS (dumpi-trace-workload) \n"
             "--dumpi-log: dumpi log file \n"
+            "ONLINE COMM OPTIONS (online_comm_workload) \n"
+            "--workload-name : name of the workload (lammps or nekbone) \n"
             "CHECKPOINT OPTIONS (checkpoint_io_workload)\n"
             "--chkpoint-size: size of aggregate checkpoint to write\n"
             "--chkpoint-bw: checkpointing bandwidth\n"
@@ -79,6 +81,9 @@ void usage(){
 
 int main(int argc, char *argv[])
 {
+#ifdef USE_ONLINE
+    ABT_init(argc, argv);
+#endif
     int print_stats = 0;
     double total_delay = 0.0;
     int64_t num_barriers = 0;
@@ -120,7 +125,7 @@ int main(int argc, char *argv[])
     int64_t num_testalls = 0;
 
     char ch;
-    while ((ch = getopt_long(argc, argv, "t:n:l:a:m:sp:wr:S:B:R:M:Q:N:z:f:u",
+    while ((ch = getopt_long(argc, argv, "t:n:l:b:a:m:sp:wr:S:B:R:M:Q:N:z:f:u",
                     long_opts, NULL)) != -1){
         switch (ch){
             case 't':
@@ -133,8 +138,8 @@ int main(int argc, char *argv[])
             case 'l':
                 strcpy(d_params.log_file_path, optarg);
                 break;
-            case 'a':
-                d_params.aggregator_cnt = atol(optarg);
+            case 'b':
+                strcpy(oc_params.workload_name, optarg);
                 break;
             case 'm':
                 strcpy(i_params.io_kernel_meta_path, optarg);
@@ -206,14 +211,21 @@ int main(int argc, char *argv[])
             usage();
             return 1;
         }
-        else if (d_params.aggregator_cnt == 0){
-            fprintf(stderr, "Expected \"--d-aggregator-cnt\" argument for darshan workload\n");
+        else{
+            wparams = (char*)&d_params;
+        }
+    }
+    else if(strcmp(type, "online_comm_workload") == 0){
+        if (n == -1){
+            fprintf(stderr,
+                    "Expected \"--num-ranks\" argument for online workload\n");
             usage();
             return 1;
         }
         else{
-            wparams = (char*)&d_params;
+            oc_params.nprocs = n;
         }
+        wparams = (char *)&oc_params;
     }
     else if (strcmp(type, "iolang_workload") == 0){
         if (n == -1){
@@ -294,6 +306,7 @@ int main(int argc, char *argv[])
 
     /* if num_ranks not set, pull it from the workload */
     if (n == -1){
+    	//printf("Getting rank count\n");
         n = codes_workload_get_rank_cnt(type, wparams, 0);
         if (n == -1) {
             fprintf(stderr,
@@ -301,16 +314,21 @@ int main(int argc, char *argv[])
                     "Specify option --num-ranks\n");
             return 1;
         }
+        printf("rank count = %d\n", n);
     }
 
     for (i = start_rank ; i < start_rank+n; i++){
         struct codes_workload_op op;
-        printf("loading %s, %d\n", type, i);
+        //printf("loading %s, %d\n", type, i);
         int id = codes_workload_load(type, wparams, 0, i);
+        double total_read_time = 0.0, total_write_time = 0.0;
+        int64_t total_read_bytes = 0, total_written_bytes = 0;
+        codes_workload_get_time(type, wparams, 0, i, &total_read_time, &total_write_time, &total_read_bytes, &total_written_bytes);
+        printf("total_read_time = %f, total_write_time = %f\n", total_read_time, total_write_time);
         assert(id != -1);
         do {
             codes_workload_get_next(id, 0, i, &op);
-            codes_workload_print_op(stdout, &op, 0, i);
+//            codes_workload_print_op(stdout, &op, 0, i);
 
             switch(op.op_type)
             {
@@ -321,16 +339,23 @@ int main(int argc, char *argv[])
                     num_barriers++;
                     break;
                 case CODES_WK_OPEN:
+                case CODES_WK_MPI_OPEN:
+                case CODES_WK_MPI_COLL_OPEN:
                     num_opens++;
                     break;
                 case CODES_WK_CLOSE:
+                case CODES_WK_MPI_CLOSE:
                     num_closes++;
                     break;
                 case CODES_WK_WRITE:
+                case CODES_WK_MPI_WRITE:
+                case CODES_WK_MPI_COLL_WRITE:
                     num_writes++;
                     write_size += op.u.write.size;
                     break;
                 case CODES_WK_READ:
+                case CODES_WK_MPI_READ:
+                case CODES_WK_MPI_COLL_READ:
                     num_reads++;
                     read_size += op.u.write.size;
                     break;
@@ -392,11 +417,11 @@ int main(int argc, char *argv[])
                     {
                         if(i == 0)
                         {
-                    int j;
-                    printf("\n rank %d wait_all: ", i);
-                    for(j = 0; j < op.u.waits.count; j++)
-                        printf(" %d ", op.u.waits.req_ids[j]);
-                    num_waitalls++;
+							int j;
+							printf("\n rank %d wait_all: ", i);
+							for(j = 0; j < op.u.waits.count; j++)
+								printf(" %d ", op.u.waits.req_ids[j]);
+							num_waitalls++;
                         }
                     }
                     break;
@@ -422,6 +447,11 @@ int main(int argc, char *argv[])
                             op.op_type);
             }
         } while (op.op_type != CODES_WK_END);
+
+    if(strcmp(type, "online_comm_workload") == 0)
+    {
+        codes_workload_finalize(type, wparams, 0, i);
+    }
     }
 
     if (print_stats)
@@ -467,6 +497,9 @@ int main(int argc, char *argv[])
         fprintf(stderr, "NUM_TESTALLS:    %"PRId64"\n", num_testalls);
     }
 
+#ifdef USE_ONLINE
+    ABT_finalize();
+#endif
     return 0;
 }
 
