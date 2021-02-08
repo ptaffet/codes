@@ -77,8 +77,18 @@ enum TRAFFIC
     BISECTION = 2, /* sends messages to node established in bisection pairing*/
         RANK_ZERO = 3, /* Send all traffic to rank 0 */
         PFISTER = 4, /* A combination of UNIFORM and RANK_ZERO */
-        GRID = 5 /* breaks into a cartesian grid and sends to 4 neighbors */
+        GRID = 5, /* breaks into a cartesian grid and sends to 4 neighbors */
+        UNIFORM_NN = 6
 
+};
+enum TRAFFIC_MAP {
+    REGULAR = 0,
+    TILED = 1, 
+    RANDOM = 2,
+    RCM = 3,
+    METIS = 4,
+    IMPROVEMENT_PARTITION = 5,
+    MAP_SCALE = 1000
 };
 
 struct svr_state
@@ -91,6 +101,18 @@ struct svr_state
     int recv_per_round;   /* In GRID, expected messages received per round */ 
 };
 
+    int hardcoded_mappings[6][4608] = {
+        {}, {}, {}, 
+        {
+#include "/g/g14/taffet2/graph/rcm.csv"
+        },
+        {
+#include "/g/g14/taffet2/graph/gpmetis-rb.csv"
+        }, 
+        {
+#include "/g/g14/taffet2/graph/custom_part.csv"
+        }
+    };
 struct svr_msg
 {
     enum svr_event svr_event_type;
@@ -104,10 +126,16 @@ struct {
     int n2; /* The width of each sub-block of the grid */
     int n3; /* The height of each sub-block of the grid */
 } cart_info = {0};
+int *rand_node_map;
+int *rand_node_reverse_map;
+static void gen_random_mappings();
+static void gen_hardcoded_mappings();
 static void rowmaj_lintoxy(int lin_id, int* outx, int* outy) ;
 static void blocked_lintoxy(int lin_id, int* outx, int* outy) ;
+static void rand_lintoxy(int lin_id, int* outx, int* outy) ;
 static int rowmaj_xytolin(int x, int y) ;
 static int blocked_xytolin(int x, int y) ;
+static int rand_xytolin(int x, int y) ;
  
 static void svr_init(
     svr_state * ns,
@@ -205,7 +233,8 @@ static void svr_add_lp_type()
 
 static void issue_event(
     svr_state * ns,
-    tw_lp * lp)
+    tw_lp * lp,
+    bool extra_delay)
 {
     (void)ns;
     tw_event *e;
@@ -244,6 +273,9 @@ static void issue_event(
     /* skew each kickoff event slightly to help avoid event ties later on */
 //    kickoff_time = 1.1 * g_tw_lookahead + tw_rand_exponential(lp->rng, arrival_time);
     kickoff_time = g_tw_lookahead + tw_rand_exponential(lp->rng, MEAN_INTERVAL);
+    if (extra_delay)
+        kickoff_time += bytes_to_ns(PAYLOAD_SZ, load*this_link_bandwidth);
+
 
     e = tw_event_new(lp->gid, kickoff_time, lp);
     m = tw_event_data(e);
@@ -257,16 +289,22 @@ static void svr_init(
 {
     ns->start_ts = 0.0;
 
-    if (traffic % 1000 == GRID) {
+    if (traffic % MAP_SCALE == GRID) {
         int recv_per_round = 4;
         int local_id = codes_mapping_get_lp_relative_id(lp->gid, 0, 0);
         int curx, cury;
-        switch(traffic/1000) {
-            case 0:
+        switch(traffic/MAP_SCALE) {
+            case REGULAR:
                 rowmaj_lintoxy(local_id, &curx, &cury);
                 break;
-            case 1:
+            case TILED:
                 blocked_lintoxy(local_id, &curx, &cury);
+                break;
+            case RANDOM:
+            case RCM:
+            case METIS:
+            case IMPROVEMENT_PARTITION:
+                rand_lintoxy(local_id, &curx, &cury);
                 break;
         }
         // Unsigned distances to the 4 boundaries
@@ -280,8 +318,8 @@ static void svr_init(
         ns->recv_per_round = recv_per_round;
     }
 
-    for (int j = 0; j < 4; j++)
-        issue_event(ns, lp);
+    for (int j = 0; j < 1; j++)
+        issue_event(ns, lp, false);
     return;
 }
 
@@ -297,6 +335,47 @@ static void handle_kickoff_rev_event(
 	model_net_event_rc2(lp, &m->event_rc);
     tw_rand_reverse_unif(lp->rng);
 }	
+static void gen_random_mappings() {
+    // Deterministically create a random-looking map
+    rand_node_map = malloc(sizeof(int) * num_nodes);
+    rand_node_reverse_map = malloc(sizeof(int) * num_nodes);
+    int prim_root, prime;
+    if (num_nodes == 3564) {
+        prim_root = 1275;
+        prime = 3571;
+    } else if (num_nodes == 4608) {
+        prim_root = 2411;
+        prime = 4621;
+    } else if (num_nodes == 3072) {
+        prime = 3079;
+        prim_root = 2727;
+    }
+    int i = 0;
+    int acc = 1;
+    while (i < num_nodes) {
+        acc = (acc * prim_root) % prime;
+        if (acc <= num_nodes) {
+            rand_node_map[i] = acc - 1;
+            rand_node_reverse_map[acc - 1] = i;
+            i++;
+        }
+    }
+
+}
+static void gen_hardcoded_mappings() {
+    rand_node_map = malloc(sizeof(int) * num_nodes);
+    rand_node_reverse_map = malloc(sizeof(int) * num_nodes);
+    for (int i = 0; i < num_nodes; i++) {
+        if (traffic / MAP_SCALE == RCM) {
+            rand_node_map[i] = hardcoded_mappings[traffic / MAP_SCALE][i] - 1;
+            rand_node_reverse_map[rand_node_map[i]] = i;
+        }
+        else {
+            rand_node_reverse_map[i] = hardcoded_mappings[traffic / MAP_SCALE][i];
+            rand_node_map[rand_node_reverse_map[i]] = i;
+        }
+    }
+}
 static void rowmaj_lintoxy(int lin_id, int* outx, int* outy) {
     *outx = lin_id / (num_nodes / cart_info.n1);
     *outy = lin_id % (num_nodes / cart_info.n1);
@@ -309,6 +388,9 @@ static void blocked_lintoxy(int lin_id, int* outx, int* outy) {
     *outx += block_off / cart_info.n3;
     *outy += block_off % cart_info.n3;
 }
+static void rand_lintoxy(int lin_id, int* outx, int* outy) {
+    rowmaj_lintoxy(rand_node_map[lin_id], outx, outy);
+}
 static int rowmaj_xytolin(int x, int y) {
     return x * (num_nodes / cart_info.n1) + y;
 }
@@ -318,6 +400,9 @@ static int blocked_xytolin(int x, int y) {
     int lin_blockn = blockx + blocky * cart_info.n1/cart_info.n2;
     int lin_block_off = (x % cart_info.n2)*cart_info.n3 + (y % cart_info.n3);
     return lin_blockn * cart_info.n2 * cart_info.n3 + lin_block_off;
+}
+static int rand_xytolin(int x, int y) {
+    return rand_node_reverse_map[rowmaj_xytolin(x,y)];
 }
 static void handle_kickoff_event(
 	    svr_state * ns,
@@ -374,6 +459,8 @@ static void handle_kickoff_event(
         case BISECTION:
             {
                 local_dest = (local_id + num_nodes/2) % num_nodes;
+                if (traffic / MAP_SCALE != REGULAR)
+                    local_dest = rand_node_map[local_dest];
             }
             break;
         case PFISTER:
@@ -398,12 +485,18 @@ static void handle_kickoff_event(
         case GRID: 
             {
                 int curx, cury;
-                switch(traffic/1000) {
-                    case 0:
+                switch(traffic/MAP_SCALE) {
+                    case REGULAR:
                         rowmaj_lintoxy(local_id, &curx, &cury);
                         break;
-                    case 1:
+                    case TILED:
                         blocked_lintoxy(local_id, &curx, &cury);
+                        break;
+                    case RANDOM:
+                    case RCM:
+                    case METIS:
+                    case IMPROVEMENT_PARTITION:
+                        rand_lintoxy(local_id, &curx, &cury);
                         break;
                 }
                 int destx, desty;
@@ -418,29 +511,72 @@ static void handle_kickoff_event(
                     destx = curx;
                 }
 
-                /* if (destx < 0 || desty < 0 || destx >= cart_info.n1 || desty >= num_nodes / cart_info.n1) {
+                if (destx < 0 || desty < 0 || destx >= cart_info.n1 || desty >= num_nodes / cart_info.n1) {
                    free(m_local);
                    free(m_remote);
+                   ns->msg_sent_count++;
+                   printf("Message from %d would be out of bounds. Waiting for next message\n", local_id);
+                   issue_event(ns, lp, true);
                    return;
-                   }*/
-                if (destx < 0)
+                }
+                /*if (destx < 0)
                     destx *= -1;
                 if (desty < 0)
                     desty *= -1;
                 if (destx >= cart_info.n1)
                     destx = 2*(cart_info.n1 - 1) - destx;
                 if (desty >= num_nodes/cart_info.n1)
-                    desty = 2*(num_nodes/cart_info.n1 - 1) - desty;
-                switch(traffic/1000) {
-                    case 0:
+                    desty = 2*(num_nodes/cart_info.n1 - 1) - desty;*/
+                switch(traffic/MAP_SCALE) {
+                    case REGULAR:
                         local_dest = rowmaj_xytolin(destx, desty);
                         break;
-                    case 1:
+                    case TILED:
                         local_dest = blocked_xytolin(destx, desty);
+                        break;
+                    case RANDOM:
+                    case RCM:
+                    case METIS:
+                    case IMPROVEMENT_PARTITION:
+                        local_dest = rand_xytolin(destx, desty);
                         break;
                 }
             }
             break;
+        case UNIFORM_NN:
+            {
+                int pc = __builtin_popcount(local_id*local_id);
+                if (pc % 2 == 0) {
+                    if (traffic / MAP_SCALE == 2) {
+                        free(m_local);
+                        free(m_remote);
+                        ns->msg_sent_count++;
+                        issue_event(ns, lp, true);
+                        return;
+                    }
+                    if (local_id == 0)
+                        local_dest = num_nodes - 1;
+                    else
+                        local_dest = local_id - 1;
+                    while (__builtin_popcount(local_dest*local_dest) % 2 != 0)
+                        local_dest--;
+                }
+                else {
+                    do {
+                        if (traffic / MAP_SCALE == 1) {
+                            free(m_local);
+                            free(m_remote);
+                            ns->msg_sent_count++;
+                            issue_event(ns, lp, true);
+                            return;
+                        }
+                        local_dest = tw_rand_integer(lp->rng, 0, num_nodes - 1);
+                    }
+                    while(local_dest != local_id && __builtin_popcount(local_dest*local_dest) % 2 == 0);
+                }
+            }
+                
+
     }
    // printf("Sending from %d to %ld\n", local_id, local_dest);
 
@@ -494,8 +630,8 @@ static void handle_remote_event(
     if (traffic % 1000 == GRID) {
         if (ns->msg_recvd_count % ns->recv_per_round == 0) {
         printf("Node %d finished round %d at time %f\n", codes_mapping_get_lp_relative_id(lp->gid, 0, 0), ns->msg_recvd_count / ns->recv_per_round, tw_now(lp));
-            for (int i = 0; i < 4; i++)
-                issue_event(ns, lp);
+            for (int i = 0; i < 0; i++)
+                issue_event(ns, lp, false);
         }
     } 
     else {
@@ -527,7 +663,7 @@ static void handle_ack_event(
     (void)b;
     (void)m;
     (void)lp;
-   issue_event(ns, lp);
+   issue_event(ns, lp, false);
 }
 
 static void handle_local_rev_event(
@@ -552,6 +688,9 @@ static void handle_local_event(
     (void)m;
     (void)lp;
     ns->local_recvd_count++;
+    if (traffic % 1000 == GRID) {
+        issue_event(ns, lp, false);
+    }
 }
 
 static void svr_finalize(
@@ -693,6 +832,17 @@ int main(
     if (num_nodes == 3564) {
         cart_info.n2 = 3;
         cart_info.n3 = 6;
+    }
+    if (num_nodes == 4608) {
+        cart_info.n2 = 8;
+        cart_info.n3 = 4;
+    }
+
+    if (traffic / 1000 == RANDOM) {
+        gen_random_mappings();
+    }
+    if (traffic / 1000 >= RCM) {
+        gen_hardcoded_mappings();
     }
 
 

@@ -11,6 +11,12 @@ extern char *modelnet_stats_dir;
 
 typedef struct fattree_message fattree_message;
 
+struct reservoir_sample 
+{
+	unsigned short nhops;
+	int switch_id;
+	int output_port;
+};
 /* this message is used for both fattree compute nodes and routers */
 struct fattree_message
 {
@@ -81,6 +87,10 @@ struct fattree_message
   int remote_event_size_bytes;
   int local_event_size_bytes;
 
+  /* for reservoir sampling */
+  struct reservoir_sample res_sampl;
+  unsigned char was_congested;
+  struct reservoir_sample cong_res_sampl;
 };
 
 #endif /* end of include guard: FATTREE_H */

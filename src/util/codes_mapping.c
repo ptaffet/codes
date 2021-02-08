@@ -77,13 +77,16 @@ int codes_mapping_get_lps_for_pe()
 /* Takes the global LP ID and returns the rank (PE id) on which the LP is mapped */
 tw_peid codes_mapping( tw_lpid gid)
 {
-    tw_lpid lps_on_pes_with_leftover = lps_leftover * (lps_per_pe_floor+1);
+    int size;
+    MPI_Comm_size(MPI_COMM_CODES, &size);
+    return gid % size;
+    /* tw_lpid lps_on_pes_with_leftover = lps_leftover * (lps_per_pe_floor+1);
     if (gid < lps_on_pes_with_leftover){
         return gid / (lps_per_pe_floor+1);
     }
     else{
         return (gid-lps_on_pes_with_leftover)/lps_per_pe_floor + lps_leftover;
-    }
+    } */
   /*return gid / lps_per_pe_floor;*/
 }
 
@@ -464,15 +467,12 @@ static void codes_mapping_init(void)
      for(kpid = 0; kpid < nkp_per_pe; kpid++)
 	tw_kp_onpe(kpid, g_tw_pe[0]);
 
-     tw_lpid lp_start =
-         g_tw_mynode * lps_per_pe_floor + mini(g_tw_mynode,lps_leftover);
-     tw_lpid lp_end =
-         (g_tw_mynode+1) * lps_per_pe_floor + mini(g_tw_mynode+1,lps_leftover);
+     int pes = tw_nnodes();
+     tw_lpid numlps  = lps_per_pe_floor * pes + lps_leftover;
 
-     for (lpid = lp_start; lpid < lp_end; lpid++)
+     for (lpid = g_tw_mynode, ross_lid = 0; lpid < numlps; lpid += pes, ross_lid++)
       {
 	 ross_gid = lpid;
-	 ross_lid = lpid - lp_start;
 	 kpid = ross_lid % g_tw_nkp;
 	 pe = tw_getpe(kpid % g_tw_npe);
 	 codes_mapping_get_lp_info(ross_gid, NULL, &grp_id, lp_type_name,
@@ -489,7 +489,7 @@ static void codes_mapping_init(void)
          else
              /* sorry, const... */
              tw_lp_settype(ross_lid, (tw_lptype*) lptype);
-         if (g_st_ev_trace || g_st_model_stats || g_st_use_analysis_lps)
+         if (g_st_ev_trace || g_st_model_stats)
          {
              trace_type = st_model_type_lookup(lp_type_name);
              st_model_settype(ross_lid, (st_model_types*) trace_type);
@@ -503,8 +503,8 @@ static void codes_mapping_init(void)
  * global LP IDs are unique across all PEs, local LP IDs are unique within a PE */
 static tw_lp * codes_mapping_to_lp( tw_lpid lpid)
 {
-   int index = lpid - (g_tw_mynode * lps_per_pe_floor) -
-       mini(g_tw_mynode, lps_leftover);
+    int pes = tw_nnodes();
+   int index = (lpid  - g_tw_mynode) / pes;
 //   printf("\n global id %d index %d lps_before %d lps_offset %d local index %d ", lpid, index, lps_before, g_tw_mynode, local_index);
    return g_tw_lp[index];
 }

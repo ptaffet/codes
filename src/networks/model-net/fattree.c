@@ -22,15 +22,16 @@
 #define MEAN_PROCESS 1.0
 
 #define TERMINAL_GUID_PREFIX ((uint64_t)(64) << 32)
-#define FTREE_HASH_TABLE_SIZE 4999
+#define FTREE_HASH_TABLE_SIZE 29989
 
 // debugging parameters
-#define TRACK_PKT -1
+#define TRACK_PKT 388402465
 //#define TRACK_PKT 2820
 #define FATTREE_HELLO 0
 #define FATTREE_DEBUG 0
 #define FATTREE_CONNECTIONS 0
 #define FATTREE_MSG 0
+#define DEBUG 0
 #define DEBUG_RC 0
 
 //Data Collection Output Files
@@ -161,6 +162,8 @@ struct fattree_param
   int rail_size_limit;
   int num_rails;
   int ports_per_nic;
+
+  int res_sample_freq;
 };
 
 struct ftree_hash_key
@@ -717,6 +720,7 @@ void post_switch_init(switch_state *s, tw_lp *lp)
      tw_error(TW_LOC, "Error while reading the routing table");
    }
   }
+
 }
 
 
@@ -899,6 +903,13 @@ static void fattree_read_config(const char * anno, fattree_param *p){
   if(rc) {
     p->chunk_size = 512;
   }
+
+  rc = configuration_get_value_int(&config, "PARAMS", "res_sample_freq", anno, &p->res_sample_freq);
+  if (rc) {
+	  p->res_sample_freq = 1024;
+  }
+  if(!g_tw_mynode) printf("Random sampling one out of every %d packets for reservoir sampling\n", p->res_sample_freq);
+
 
   char routing_str[MAX_NAME_LENGTH];
   configuration_get_value(&config, "PARAMS", "routing", anno, routing_str,
@@ -1652,9 +1663,26 @@ void ft_packet_generate(ft_terminal_state * s, tw_bf * bf, fattree_message * msg
 
   nic_ts = g_tw_lookahead + (msg->packet_size * s->params->cn_delay) + tw_rand_unif(lp->rng);
 
+  int num_nodes = p->num_switches[0] * p->l0_term_size;
+  int local_id = codes_mapping_get_lp_relative_id(lp->gid, 0, 0);
   msg->my_N_hop = 0;
+  msg->res_sampl.nhops = 1;
+  msg->res_sampl.switch_id = local_id - num_nodes; 
+  msg->res_sampl.output_port = 0;
 
-  msg->packet_ID = lp->gid + g_tw_nlp * s->packet_counter;
+  msg->was_congested = 0;
+
+  msg->cong_res_sampl.nhops = 0;
+  msg->cong_res_sampl.switch_id = 0;
+  msg->cong_res_sampl.output_port = 0;
+
+
+  msg->packet_ID = lp->gid*100000 + s->packet_counter;
+#if DEBUG
+  if (lp->gid == 3884) {
+	  printf("Generating packet %llu destined for %d at time %f\n", msg->packet_ID, codes_mapping_get_lp_relative_id(msg->final_dest_gid, 0, 0), tw_now(lp));
+  }
+#endif
 
   int target_queue = msg->rail_id;
   if(s->params->rail_select == RAIL_ADAPTIVE && 
@@ -1698,9 +1726,30 @@ void ft_packet_generate(ft_terminal_state * s, tw_bf * bf, fattree_message * msg
     append_to_fattree_message_list(s->terminal_msgs, s->terminal_msgs_tail,
       target_queue, cur_chunk);
     s->terminal_length[target_queue] += s->params->chunk_size;
+	if (s->terminal_length[target_queue] >= s->params->cn_vc_size) {
+		cur_chunk->msg.cong_res_sampl = cur_chunk->msg.res_sampl;
+		cur_chunk->msg.was_congested = 1;
+	}
+  if (s->params->res_sample_freq == -1) {
+	  tw_output(lp, "Packet,%d,%d,%d,%d,%d,%d,%llu,%f,%f,%d,%d,%d,%"PRIu64"\n", 
+			  cur_chunk->msg.res_sampl.switch_id, 0, 1,
+			  cur_chunk->msg.cong_res_sampl.switch_id, 0, cur_chunk->msg.was_congested,
+			  cur_chunk->msg.packet_ID,  tw_now(lp),  cur_chunk->msg.travel_start_time, 
+			  codes_mapping_get_lp_relative_id(cur_chunk->msg.final_dest_gid, 0, 0), codes_mapping_get_lp_relative_id(cur_chunk->msg.sender_lp, 0, 0), cur_chunk->msg.was_congested, cur_chunk->msg.message_id);
+  }
   }
 
+#if DEBUG
+  if (msg->packet_ID == TRACK_PKT) {
+	  printf("Packet %llu at time %f. Congestion at terminal: %f\n", msg->packet_ID, tw_now(lp), (s->vc_occupancy[target_queue] + s->terminal_length[target_queue]) / ((double) s->params->cn_vc_size));
+  }
+#endif
   if(s->terminal_length[target_queue] < s->params->cn_vc_size) {
+#if DEBUG
+	  if (msg->packet_ID == TRACK_PKT) {
+		  printf("Idling with Packet %llu at time %f for %f\n", msg->packet_ID, tw_now(lp), nic_ts);
+	  }
+#endif
     model_net_method_idle_event2(nic_ts, 0, msg->rail_id, lp);
   } else {
     bf->c11 = 1;
@@ -1791,14 +1840,25 @@ void ft_packet_send(ft_terminal_state * s, tw_bf * bf, fattree_message * msg,
 
   fattree_message_list* cur_entry = s->terminal_msgs[msg->vc_index];
 
+  double scaled_q_len = (s->terminal_length[msg->vc_index]) / ((double) s->params->cn_vc_size);
   if(s->vc_occupancy[msg->vc_index] + s->params->chunk_size > s->params->cn_vc_size ||
     cur_entry == NULL) {
     bf->c1 = 1;
     s->in_send_loop[msg->vc_index] = 0;
     msg->saved_busy_time = s->last_buf_full[msg->vc_index];
     s->last_buf_full[msg->vc_index] = tw_now(lp);
+#if DEBUG
+	if (lp->gid == 3884) {
+		printf("Credit,%f,%f,1.0\n", tw_now(lp), scaled_q_len);
+	}
+#endif
     return;
   }
+#if DEBUG
+  if (lp->gid == 3884) {
+	  printf("Credit,%f,%f,%f\n", tw_now(lp), scaled_q_len, s->vc_occupancy[msg->vc_index] / (double) s->params->cn_vc_size);
+  }
+#endif
   
   uint64_t num_chunks = cur_entry->msg.packet_size/s->params->chunk_size;
   if(cur_entry->msg.packet_size % s->params->chunk_size)
@@ -1819,6 +1879,7 @@ void ft_packet_send(ft_terminal_state * s, tw_bf * bf, fattree_message * msg,
   s->terminal_available_time[msg->vc_index] = maxd(s->terminal_available_time[msg->vc_index], tw_now(lp));
   s->terminal_available_time[msg->vc_index] += ts;
 
+  cur_entry->msg.travel_start_time = tw_now(lp);
   // we are sending an event to the switch, so no method_event here
   ts = s->terminal_available_time[msg->vc_index] - tw_now(lp);
 
@@ -1829,6 +1890,12 @@ void ft_packet_send(ft_terminal_state * s, tw_bf * bf, fattree_message * msg,
     memcpy(model_net_method_get_edata(FATTREE, m), cur_entry->event_data,
         m->remote_event_size_bytes);
   }
+#if DEBUG
+  if (lp->gid == 3884) {
+	  printf("Sending packet %llu from node %llu to switch lp %llu at time %f. Will take %f.\n", cur_entry->msg.packet_ID, lp->gid, s->switch_lp[msg->vc_index], tw_now(lp), ts);
+  }
+#endif
+
 
   m->type = S_ARRIVE;
   m->src_terminal_id = lp->gid;
@@ -1877,6 +1944,11 @@ void ft_packet_send(ft_terminal_state * s, tw_bf * bf, fattree_message * msg,
     m_new->vc_index = msg->vc_index;
     m_new->magic = fattree_terminal_magic_num;
     tw_event_send(e);
+#if DEBUG
+	if (cur_entry->msg.packet_ID == TRACK_PKT) {
+		printf("Creating T_SEND event for packet %llu. vc_occupancy: %d. Time: %f, ts=%f\n", cur_entry->msg.packet_ID, s->vc_occupancy[msg->vc_index], tw_now(lp), ts);
+	}
+#endif
   } else {
     bf->c4 = 1;
     s->in_send_loop[msg->vc_index] = 0;
@@ -1922,6 +1994,21 @@ void switch_packet_receive_rc(switch_state * s,
         s->queued_length[output_port] -= s->params->chunk_size;
         s->last_buf_full[output_port] = msg->saved_busy_time;
     }
+/*	if(bf->c9)
+	{
+	  msg->encountered_congested_count--;
+	  printf("Packet %llu unmarked for congestion\n", msg->packet_ID);
+	}
+	if (msg->encountered_congested_count < 0) {
+		printf("Negative congestion c9:%d cnt:%d?\n", (int) bf->c9, msg->encountered_congested_count);
+	}
+	msg->res_sampl = msg->saved_res_sampl;
+	msg->cong_res_sampl = msg->saved_cong_res_sampl;
+	*/
+
+    tw_rand_reverse_unif(lp->rng);
+    tw_rand_reverse_unif(lp->rng);
+    tw_rand_reverse_unif(lp->rng);
 }
 
 /* Packet arrives at the switch and a credit is sent back to the sending
@@ -1932,6 +2019,8 @@ void switch_packet_receive( switch_state * s, tw_bf * bf,
   bf->c1 = 0;
   bf->c2 = 0;
   bf->c3 = 0;
+  bf->c4 = 0;
+  bf->c9 = 0;
 
   tw_stime ts;
 
@@ -1966,6 +2055,44 @@ void switch_packet_receive( switch_state * s, tw_bf * bf,
   cur_chunk->msg.vc_off = out_off;
   cur_chunk->msg.my_N_hop++;
 
+#if DEBUG
+  if (msg->packet_ID == TRACK_PKT) {
+	  double congestion_score = s->vc_occupancy[output_port] + s->queued_length[output_port];
+	  congestion_score /= max_vc_size;
+	  printf("Packet %llu arrived at switch %d at time %f. Full ratio is %f.\n", msg->packet_ID, s->switch_id, tw_now(lp), congestion_score);
+  }
+#endif
+  //printf("switch,%d.%d,%d,%d\n", s->switch_id, output_port, s->queued_length[output_port], s->vc_occupancy[output_port]);
+  bool congested = s->vc_occupancy[output_port] + s->queued_length[output_port] > max_vc_size;
+  // Raise to 4th power
+  /*
+  double congestion_score = s->vc_occupancy[output_port] + s->queued_length[output_port];
+  congestion_score /= max_vc_size;
+  congestion_score *= congestion_score;
+  congestion_score *= congestion_score;
+  congested = tw_rand_unif(lp->rng) < congestion_score; */
+
+  if (tw_rand_integer(lp->rng, 0, cur_chunk->msg.res_sampl.nhops++) == 0) {
+	  cur_chunk->msg.res_sampl.switch_id = s->switch_id;
+	  cur_chunk->msg.res_sampl.output_port =  output_port;
+	  cur_chunk->msg.was_congested = congested;
+  }
+  if (tw_rand_integer(lp->rng, 0, cur_chunk->msg.cong_res_sampl.nhops) == 0 && congested) {
+	  cur_chunk->msg.cong_res_sampl.switch_id = s->switch_id;
+	  cur_chunk->msg.cong_res_sampl.output_port =  output_port;
+  }
+  if (congested) {
+	  bf->c9 = 1;
+	  cur_chunk->msg.cong_res_sampl.nhops++;
+  }
+  if (s->params->res_sample_freq == -1) {
+	  tw_output(lp, "Packet,%d,%d,%d,%d,%d,%d,%llu,%f,%f,%d,%d,%d,%"PRIu64"\n", s->switch_id, output_port, 1,
+			  congested ? s->switch_id : 0, congested ? output_port : 0, congested ? 1 : 0, 
+			  msg->packet_ID,  tw_now(lp),  msg->travel_start_time, 
+			  codes_mapping_get_lp_relative_id(msg->final_dest_gid, 0, 0), codes_mapping_get_lp_relative_id(msg->sender_lp, 0, 0), congested, msg->message_id);
+  }
+  //printf("congestion,%d,%llu,%d,%d\n", s->switch_id, cur_chunk->msg.packet_ID, output_port, s->queued_length[output_port]);
+
   if(s->vc_occupancy[output_port] + s->params->chunk_size <= max_vc_size) {
     bf->c1 = 1;
     switch_credit_send(s, bf, msg, lp, -1);
@@ -1995,6 +2122,9 @@ void switch_packet_receive( switch_state * s, tw_bf * bf,
     msg->saved_busy_time = s->last_buf_full[output_port];
     s->last_buf_full[output_port] = tw_now(lp);
   }
+
+  //if (s->vc_occupancy[output_port] > 1024)
+	//  printf("Output port %d, vc_occupancy: %d, queued_length: %d\n", output_port, s->vc_occupancy[output_port], s->queued_length[output_port]);
   //for reverse
   msg->saved_vc = output_port;
 
@@ -2093,6 +2223,11 @@ void switch_packet_send( switch_state * s, tw_bf * bf, fattree_message * msg,
   s->next_output_available_time[output_port] += ts;
 
   ts = s->next_output_available_time[output_port] - tw_now(lp);
+#if DEBUG
+  if (cur_entry->msg.packet_ID == TRACK_PKT) {
+	  printf("Packet %llu leaving switch %d at time %f. Delay to next event is %f.\n", cur_entry->msg.packet_ID, s->switch_id, tw_now(lp), ts);
+  }
+#endif
   void * m_data;
   if (to_terminal) {
     e = model_net_method_event_new(next_stop, ts, lp,
@@ -2242,6 +2377,11 @@ void ft_terminal_buf_update(ft_terminal_state * s, tw_bf * bf,
   tw_stime ts = codes_local_latency(lp);
   s->vc_occupancy[msg->vc_index] -= s->params->chunk_size;
 
+#if DEBUG
+  if (msg->packet_ID == TRACK_PKT) {
+	  printf("Packet %llu in queue of terminal %d at time %f. occupancy = %d.\n", msg->packet_ID, s->terminal_id, tw_now(lp), s->vc_occupancy[msg->vc_index]);
+  }
+#endif
   /* Update the terminal buffer time */
   if(s->last_buf_full[msg->vc_index] > 0)
   {
@@ -2314,6 +2454,12 @@ void switch_buf_update(switch_state * s, tw_bf * bf, fattree_message * msg,
   int indx = msg->vc_index;
   s->vc_occupancy[indx] -= s->params->chunk_size;
 
+#if DEBUG
+  if (s->switch_id == 99 && indx == 4) {
+	  printf("Updating buffer. Packet: %llu switch %d.%d at time %f. vc_o: %d, qlen: %d.\n", msg->packet_ID, s->switch_id, indx, tw_now(lp), s->vc_occupancy[indx] , s->queued_length[indx]);
+	  printf("lbf: %f, q_msg: %d, pen_msg: %d, send_loop: %d\n", s->last_buf_full[indx], s->queued_msgs[indx] != NULL, s->pending_msgs[indx] != NULL, s->in_send_loop[indx]);
+  }
+#endif
   if(s->last_buf_full[indx])
   {
     bf->c3 = 1;
@@ -2327,8 +2473,14 @@ void switch_buf_update(switch_state * s, tw_bf * bf, fattree_message * msg,
 
   if(s->queued_msgs[indx] != NULL) {
     bf->c1 = 1;
+
     fattree_message_list *head = return_head( s->queued_msgs,
         s->queued_msgs_tail, indx);
+#if DEBUG
+	if (head->msg.packet_ID == TRACK_PKT) {
+		printf("Packet: %llu moving from queued to pending at time %f\n", head->msg.packet_ID, tw_now(lp));
+	}
+#endif
     s->queued_length[indx] -= s->params->chunk_size;
     switch_credit_send( s, bf,  &head->msg, lp, 1);
     append_to_fattree_message_list( s->pending_msgs, s->pending_msgs_tail,
@@ -2465,6 +2617,8 @@ void ft_packet_arrive_rc(ft_terminal_state * s, tw_bf * bf, fattree_message * ms
       s->rank_tbl_pop--;
       free_tmp(tmp);
     }
+	// Temporary sampling for sampling the reservoir samples
+    tw_rand_reverse_unif(lp->rng);
 }
 
 /* packet arrives at the destination terminal */
@@ -2557,9 +2711,10 @@ void ft_packet_arrive(ft_terminal_state * s, tw_bf * bf, fattree_message * msg,
     stat->recv_time += (tw_now(lp) - msg->travel_start_time);
 
 #if DEBUG == 1
- if( msg->packet_ID == TRACK
-          && msg->chunk_id == num_chunks-1
-          && msg->message_id == TRACK_MSG)
+ if( msg->packet_ID == TRACK_PKT
+          //&& msg->chunk_id == num_chunks-1
+          //&& msg->message_id == TRACK_MSG)
+	 )
   {
     printf( "(%lf) [Terminal %d] packet %lld has arrived  \n",
         tw_now(lp), (int)lp->gid, msg->packet_ID);
@@ -2637,28 +2792,40 @@ void ft_packet_arrive(ft_terminal_state * s, tw_bf * bf, fattree_message * msg,
            return;
         }*/
 
-    if(tmp->num_chunks >= (int)total_chunks)
-    {
-        bf->c7 = 1;
+	if(tmp->num_chunks >= (int)total_chunks)
+	{
+		bf->c7 = 1;
 
-        N_finished_msgs++;
-        total_msg_sz += msg->total_size;
-        s->total_msg_size += msg->total_size;
-        s->finished_msgs++;
+		N_finished_msgs++;
+		total_msg_sz += msg->total_size;
+		s->total_msg_size += msg->total_size;
+		s->finished_msgs++;
 
 
-	if(msg->packet_ID == LLU(TRACK_PKT))
-            printf("\n Packet %llu has been sent from lp %llu\n", msg->packet_ID, LLU(lp->gid));
+		if(msg->packet_ID == LLU(TRACK_PKT))
+			printf("\n Packet %llu has been sent from lp %llu\n", msg->packet_ID, LLU(lp->gid));
 
-        if(tmp->remote_event_data && tmp->remote_event_size > 0) {
-          bf->c8 = 1;
-          ft_send_remote_event(s, msg, lp, bf, tmp->remote_event_data, tmp->remote_event_size);
-        }
-        /* Remove the hash entry */
-        qhash_del(hash_link);
-        rc_stack_push(lp, tmp, free_tmp, s->st);
-        s->rank_tbl_pop--;
-   }
+		/*if (key.sender_id == 1152 || codes_mapping_get_lp_relative_id(msg->sender_lp, 0, 0)==1152) {
+			tw_output(lp, "FINALLY! Size: %d, category: %s, key.sender_id: %d, relative: %d\n", tmp->remote_event_size, msg->category, key.sender_id, codes_mapping_get_lp_relative_id(msg->sender_lp, 0,0));
+		}*/
+		if(tmp->remote_event_data && tmp->remote_event_size > 0) {
+			bf->c8 = 1;
+			ft_send_remote_event(s, msg, lp, bf, tmp->remote_event_data, tmp->remote_event_size);
+			if (tmp->remote_event_size == 88) {
+				// Probably a TraceR packet
+				tw_output(lp, "Tag,%d,%" PRIu64 ",%d\n", codes_mapping_get_lp_relative_id(msg->sender_lp, 0, 0), key.message_id, ((int*)tmp->remote_event_data )[11] ); // Pretty sketchy and fragile, but this gets the tag
+			}
+		}
+		/* Remove the hash entry */
+		qhash_del(hash_link);
+		rc_stack_push(lp, tmp, free_tmp, s->st);
+		s->rank_tbl_pop--;
+	}
+
+	if (tw_rand_integer(lp->rng, 0, s->params->res_sample_freq - 1) == 0 && s->params->res_sample_freq > 0) {
+		tw_output(lp, "Packet,%d,%d,%d,%d,%d,%d,%llu,%f,%f,%d,%d,%d,%"PRIu64"\n", msg->res_sampl.switch_id, msg->res_sampl.output_port, msg->res_sampl.nhops, msg->cong_res_sampl.switch_id, msg->cong_res_sampl.output_port, msg->cong_res_sampl.nhops, msg->packet_ID,  tw_now(lp),  msg->travel_start_time, 
+				codes_mapping_get_lp_relative_id(msg->final_dest_gid, 0, 0), codes_mapping_get_lp_relative_id(msg->sender_lp, 0, 0), msg->was_congested, key.message_id);
+	}
 
   return;
 }
@@ -2719,7 +2886,7 @@ int ft_get_output_port( switch_state * s, tw_bf * bf, fattree_message * msg,
   assert(end_port > start_port);
 
   //outport = start_port;
-  // when occupancy is same, just choose random port
+ // when occupancy is same, just choose random port
   outport = tw_rand_integer(lp->rng, start_port, end_port-1);  
   int load = s->vc_occupancy[outport] + s->queued_length[outport];
   if(load != 0) {
@@ -2732,6 +2899,8 @@ int ft_get_output_port( switch_state * s, tw_bf * bf, fattree_message * msg,
       }
     }
   }
+
+
   assert(outport != -1);
   if(outport < s->num_lcons) {
     *out_off = outport % s->con_per_lneigh;
