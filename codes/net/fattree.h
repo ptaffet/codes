@@ -46,6 +46,7 @@ struct fattree_message
   short saved_off;
   int last_hop;
   int intm_id; //to find which port I connect to sender with
+  int saved_vl;
 
   /* message originating router id */
   unsigned int origin_switch_id;
@@ -91,6 +92,8 @@ struct fattree_message
   struct reservoir_sample res_sampl;
   unsigned char was_congested;
   struct reservoir_sample cong_res_sampl;
+
+  int sl;
 };
 
 #endif /* end of include guard: FATTREE_H */

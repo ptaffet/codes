@@ -98,6 +98,7 @@ enum RAIL_SELECTION_ALGO
     RAIL_ADAPTIVE,
 };
 static char routing_folder[MAX_NAME_LENGTH];
+static char sl2vl_folder[MAX_NAME_LENGTH];
 static char dot_file_p[MAX_NAME_LENGTH];
 
 /* switch magic number */
@@ -164,6 +165,9 @@ struct fattree_param
   int ports_per_nic;
 
   int res_sample_freq;
+
+  int num_sl;
+  int num_vl;
 };
 
 struct ftree_hash_key
@@ -220,6 +224,7 @@ struct ft_terminal_state
 
   tw_stime   total_time;
   uint64_t total_msg_size;
+  int64_t *link_traffic_per_vl;
   double total_hops;
   long finished_msgs;
   long finished_chunks;
@@ -237,6 +242,8 @@ struct ft_terminal_state
   tw_stime fin_chunks_time;
   tw_stime busy_time_sample;
 
+  int* dest2sl;
+  int* sl2vl;
 };
 
 /* terminal event type (1-4) */
@@ -286,6 +293,7 @@ struct switch_state
   int *in_send_loop;
   int* vc_occupancy;
   int64_t* link_traffic;
+  int64_t* link_traffic_per_vl;
   tw_lpid *port_connections;
 
   char output_buf[4096];
@@ -297,6 +305,7 @@ struct switch_state
   fattree_param *params;
   /* array to store linear forwaring tables in case we use static routing */
   int *lft;
+  int *sl2vl;
 };
 
 /* ROSS Instrumentation Support */
@@ -485,6 +494,76 @@ static int cmp_guids(const void *g1, const void *g2)
     return 1;
 }
 
+/*
+ * Read file with sl2vl mapping:
+ * PacketSL InPort OutPort OutVL
+ *
+ * All fields zero based
+ * Returns number of entries it read
+ */
+static int read_sl2vl(FILE* file, int* dest, int radix) {
+	int packetsl, inport, outport, outvl;
+	int count = 0;
+	while (fscanf(file, "%d %d %d %d", &packetsl, &inport, &outport, &outvl) == 4) {
+		dest[packetsl * radix * radix + inport * radix + outport] = outvl;
+		count++;
+	}
+	return count;
+}
+
+static int read_slmap_terminal(ft_terminal_state *s, tw_lp *lp) {
+  if (!s || !lp)
+    return -1;
+
+  char file_name[512];
+
+  sprintf(file_name, "%s/0x%016"PRIx64".sl2vl", sl2vl_folder, get_term_guid(s));
+  FILE *file = NULL;
+  if (!(file = fopen(file_name, "r")))
+    return -1;
+
+  int expected_entries = s->params->num_sl;
+  s->sl2vl = malloc(expected_entries * sizeof(int));
+  int num_entries = read_sl2vl(file, s->sl2vl, 1);
+  if (num_entries != expected_entries) {
+	  printf("Read %d entries instead of %d from %s\n", num_entries, expected_entries, file_name);
+  }
+  fclose(file);
+  file = NULL;
+
+  sprintf(file_name, "%s/0x%016"PRIx64".dest2sl", sl2vl_folder, get_term_guid(s));
+  if (!(file = fopen(file_name, "r")))
+    return -1;
+
+  s->dest2sl = calloc(s->params->num_terminals, sizeof(int));
+
+  for (int dest_num = 0; dest_num < s->params->num_terminals; dest_num++) {
+	  if (1 != fscanf(file, "%d", &s->dest2sl[dest_num]))
+		  printf("Error reading entry %d from %s\n", dest_num, file_name);
+  }
+  fclose(file);
+  return 0;
+}
+static int read_sl2vl_switch(switch_state *s, tw_lp *lp) {
+  if (!s || !lp)
+    return -1;
+
+  char file_name[512];
+
+  sprintf(file_name, "%s/0x%016"PRIx64".sl2vl", sl2vl_folder, get_switch_guid(s));
+  FILE *file = NULL;
+  if (!(file = fopen(file_name, "r")))
+    return -1;
+
+  int expected_entries = s->radix * s->radix * s->params->num_sl;
+  s->sl2vl = malloc(expected_entries * sizeof(int));
+  int num_entries = read_sl2vl(file, s->sl2vl, s->radix);
+  if (num_entries != expected_entries) {
+	  printf("Read %d entries instead of %d from %s\n", num_entries, expected_entries, file_name);
+  }
+  fclose(file);
+  return 0;
+}
 /* parse external file with give forwarding tables
  * file name: 0x<switch guid>.lft
  * content: '0x<terminal guid> <egress port>' per line, e.g.:
@@ -720,6 +799,11 @@ void post_switch_init(switch_state *s, tw_lp *lp)
      tw_error(TW_LOC, "Error while reading the routing table");
    }
   }
+  if (sl2vl_folder[0] != '\0') {
+	  if (0 != read_sl2vl_switch(s, lp)) {
+		  tw_error(TW_LOC, "Error while reading a switch SL2VL table");
+	  }
+  }
 
 }
 
@@ -953,6 +1037,16 @@ static void fattree_read_config(const char * anno, fattree_param *p){
       tw_error(TW_LOC, "routing_folder has to be provided with dump_topo || static routing");
     }
   }
+  sl2vl_folder[0] = '\0';
+  rc = configuration_get_value(&config, "PARAMS", "sl2vl_folder", anno, sl2vl_folder,
+      MAX_NAME_LENGTH);
+
+  p->num_sl = 1;
+  configuration_get_value_int(&config, "PARAMS", "num_sl", anno,
+      &p->num_sl);
+  p->num_vl = 1;
+  configuration_get_value_int(&config, "PARAMS", "num_vl", anno,
+      &p->num_vl);
  
   dot_file_p[0] = '\0'; 
   rc = configuration_get_value(&config, "PARAMS", "dot_file", anno, dot_file_p,
@@ -1090,6 +1184,7 @@ void ft_terminal_init( ft_terminal_state * s, tw_lp * lp )
    s->finished_packets = 0;
    s->total_time = 0.0;
    s->total_msg_size = 0;
+   s->link_traffic_per_vl = (int64_t*) calloc(s->params->num_vl, sizeof(int64_t));
 
 #if FATTREE_DEBUG
    printf("I am terminal %d (%llu), connected to switch %d in rail id %d\n", s->terminal_id,
@@ -1114,6 +1209,7 @@ void ft_terminal_init( ft_terminal_state * s, tw_lp * lp )
    if(dot_file && !s->rail_id)
      fflush(dot_file);
 
+   read_slmap_terminal(s, lp);
    return;
 }
 
@@ -1168,6 +1264,7 @@ void switch_init(switch_state * r, tw_lp * lp)
   r->vc_occupancy = (int*) malloc (r->radix * sizeof(int));
   r->in_send_loop = (int*) malloc (r->radix * sizeof(int));
   r->link_traffic = (int64_t*) malloc (r->radix * sizeof(int64_t));
+  r->link_traffic_per_vl = (int64_t*) calloc (p->num_vl * r->radix, sizeof(int64_t));
   r->port_connections = (tw_lpid*) malloc (r->radix * sizeof(tw_lpid));
   r->pending_msgs =
     (fattree_message_list**)malloc(r->radix * sizeof(fattree_message_list*));
@@ -1635,6 +1732,9 @@ void ft_packet_generate_rc(ft_terminal_state * s, tw_bf * bf, fattree_message * 
 	s->in_send_loop[msg->saved_vc] = 0;
     }
 
+    int vl = s->sl2vl[msg->sl];
+    s->link_traffic_per_vl[vl] -= msg->packet_size;
+
     struct mn_stats* stat;
     stat = model_net_find_stats(msg->category, s->fattree_stats_array);
     stat->send_count--;
@@ -1698,6 +1798,11 @@ void ft_packet_generate(ft_terminal_state * s, tw_bf * bf, fattree_message * msg
   }
 
   msg->saved_vc = target_queue;
+  // Set SL
+  int dest_term_local_id = codes_mapping_get_lp_relative_id(msg->dest_terminal_id, 0, 0);
+  msg->sl = s->dest2sl[dest_term_local_id];
+  int vl = s->sl2vl[msg->sl];
+  s->link_traffic_per_vl[vl] += msg->packet_size;
 
   for(uint64_t i = 0; i < num_chunks; i++)
   {
@@ -1780,6 +1885,7 @@ void ft_packet_generate(ft_terminal_state * s, tw_bf * bf, fattree_message * msg
   stat->send_time += (1/p->link_bandwidth) * msg->packet_size;
   if(stat->max_event_size < total_event_size)
     stat->max_event_size = total_event_size;
+
 
   return;
 }
@@ -2150,14 +2256,17 @@ void switch_packet_send_rc(switch_state * s,
     fattree_message_list * cur_entry = rc_stack_pop(s->st);
     assert(cur_entry);
 
+    int decrease_traffic_by = 0;
     if(bf->c11)
     {
-        s->link_traffic[output_port] -= (cur_entry->msg.packet_size % s->params->chunk_size);
+        decrease_traffic_by += cur_entry->msg.packet_size % s->params->chunk_size;
     }
     if(bf->c12)
     {
-        s->link_traffic[output_port] -= s->params->chunk_size;
+        decrease_traffic_by += s->params->chunk_size;
     }
+    s->link_traffic[output_port] -= decrease_traffic_by;
+    s->link_traffic_per_vl[msg->saved_vl * s->radix + output_port] -= decrease_traffic_by;
 
     prepend_to_fattree_message_list(s->pending_msgs,
         s->pending_msgs_tail, output_port, cur_entry);
@@ -2192,6 +2301,22 @@ void switch_packet_send( switch_state * s, tw_bf * bf, fattree_message * msg,
     s->in_send_loop[output_port] = 0;
     return;
   }
+
+  int input_port = 0;
+  tw_lpid sender;
+  if(msg->last_hop == TERMINAL) {
+	  sender = msg->src_terminal_id;
+  } else {
+	  sender = msg->intm_lp_id;
+  }
+  for (input_port = 0; input_port < s->radix; input_port++) {
+	  if (s->port_connections[input_port] == sender) 
+		  break;
+  }
+  if (input_port == s->radix)
+	  printf("Input port not found!\n");
+  int selected_vl = s->sl2vl[msg->sl * s->radix * s->radix + input_port * s->radix + output_port];
+  msg->saved_vl = selected_vl;
 
   tw_lpid next_stop = s->port_connections[output_port];
   int to_terminal = 0;
@@ -2248,14 +2373,17 @@ void switch_packet_send( switch_state * s, tw_bf * bf, fattree_message * msg,
   m->intm_id = s->switch_id;
   m->magic = switch_magic_num;
 
+  int increase_traffic_by = 0;
   if((cur_entry->msg.packet_size % s->params->chunk_size) && (cur_entry->msg.chunk_id == num_chunks - 1)) {
       bf->c11 = 1;
-      s->link_traffic[output_port] +=  (cur_entry->msg.packet_size %
+      increase_traffic_by =  (cur_entry->msg.packet_size %
               s->params->chunk_size);
   } else {
     bf->c12 = 1;
-    s->link_traffic[output_port] += s->params->chunk_size;
+    increase_traffic_by = s->params->chunk_size;
   }
+  s->link_traffic[output_port] += increase_traffic_by;
+  s->link_traffic_per_vl[selected_vl * s->radix + output_port] += increase_traffic_by;
 
   /* Determine the event type. If the packet has arrived at the final destination
      switch then it should arrive at the destination terminal next. */
@@ -3072,6 +3200,25 @@ void fattree_switch_final(switch_state * s, tw_lp * lp)
 
     assert(written < 4096);
     lp_io_write(lp->gid, "fattree-switch-traffic", written, s->output_buf2);
+
+    int num_vls = s->params->num_vl;
+    if(!s->switch_id && !s->rail_id)
+    {
+        written = sprintf(s->output_buf2, "# Format <LP ID> <Rail ID> <Level ID> <Switch ID> <VL num> <Link traffic per switch port(s)>");
+        written += sprintf(s->output_buf2 + written, "# Switch ports: %d, num vls %d",
+            s->radix, num_vls);
+    }
+    for (int vlnum = 0; vlnum < num_vls; vlnum++) {
+        written += sprintf(s->output_buf2 + written, "\n %llu %d %d %d %d",
+                LLU(lp->gid),s->rail_id,s->switch_level,s->switch_id, vlnum);
+
+        for(int d = 0; d < s->radix; d++)
+            written += sprintf(s->output_buf2 + written, " %lld", LLD(s->link_traffic_per_vl[vlnum * s->radix + d]));
+        written += sprintf(s->output_buf2 + written, "\n");
+    }
+
+    assert(written < 4096);
+    lp_io_write(lp->gid, "fattree-switch-traffic-pervl", written, s->output_buf2);
 }
 
 /* Update the buffer space associated with this switch LP */
