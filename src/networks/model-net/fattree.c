@@ -517,13 +517,17 @@ static int read_slmap_terminal(ft_terminal_state *s, tw_lp *lp) {
 
   char file_name[512];
 
+  int expected_entries = s->params->num_sl;
+  // If file doesn't exist, initialize these to all zero
+  // i.e. all dests are for sl=0, which maps to vl=0
+  s->sl2vl = calloc(expected_entries, sizeof(int));
+  s->dest2sl = calloc(s->params->num_terminals, sizeof(int));
+
   sprintf(file_name, "%s/0x%016"PRIx64".sl2vl", sl2vl_folder, get_term_guid(s));
   FILE *file = NULL;
   if (!(file = fopen(file_name, "r")))
     return -1;
 
-  int expected_entries = s->params->num_sl;
-  s->sl2vl = malloc(expected_entries * sizeof(int));
   int num_entries = read_sl2vl(file, s->sl2vl, 1);
   if (num_entries != expected_entries) {
 	  printf("Read %d entries instead of %d from %s\n", num_entries, expected_entries, file_name);
@@ -535,7 +539,6 @@ static int read_slmap_terminal(ft_terminal_state *s, tw_lp *lp) {
   if (!(file = fopen(file_name, "r")))
     return -1;
 
-  s->dest2sl = calloc(s->params->num_terminals, sizeof(int));
 
   for (int dest_num = 0; dest_num < s->params->num_terminals; dest_num++) {
 	  if (1 != fscanf(file, "%d", &s->dest2sl[dest_num]))
@@ -548,6 +551,10 @@ static int read_sl2vl_switch(switch_state *s, tw_lp *lp) {
   if (!s || !lp)
     return -1;
 
+  int expected_entries = s->radix * s->radix * s->params->num_sl;
+  // If file doesn't exist, all sls map to vl=0
+  s->sl2vl = calloc(expected_entries, sizeof(int));
+
   char file_name[512];
 
   sprintf(file_name, "%s/0x%016"PRIx64".sl2vl", sl2vl_folder, get_switch_guid(s));
@@ -555,8 +562,6 @@ static int read_sl2vl_switch(switch_state *s, tw_lp *lp) {
   if (!(file = fopen(file_name, "r")))
     return -1;
 
-  int expected_entries = s->radix * s->radix * s->params->num_sl;
-  s->sl2vl = malloc(expected_entries * sizeof(int));
   int num_entries = read_sl2vl(file, s->sl2vl, s->radix);
   if (num_entries != expected_entries) {
 	  printf("Read %d entries instead of %d from %s\n", num_entries, expected_entries, file_name);
@@ -799,7 +804,10 @@ void post_switch_init(switch_state *s, tw_lp *lp)
      tw_error(TW_LOC, "Error while reading the routing table");
    }
   }
-  if (sl2vl_folder[0] != '\0') {
+  if (s->radix == 0) {
+	  printf("Skipping switch with 0 radix\n");
+  }
+  else if (sl2vl_folder[0] != '\0') {
 	  if (0 != read_sl2vl_switch(s, lp)) {
 		  tw_error(TW_LOC, "Error while reading a switch SL2VL table");
 	  }
@@ -2304,10 +2312,10 @@ void switch_packet_send( switch_state * s, tw_bf * bf, fattree_message * msg,
 
   int input_port = 0;
   tw_lpid sender;
-  if(msg->last_hop == TERMINAL) {
-	  sender = msg->src_terminal_id;
+  if(cur_entry->msg.last_hop == TERMINAL) {
+	  sender = cur_entry->msg.src_terminal_id;
   } else {
-	  sender = msg->intm_lp_id;
+	  sender = cur_entry->msg.intm_lp_id;
   }
   for (input_port = 0; input_port < s->radix; input_port++) {
 	  if (s->port_connections[input_port] == sender) 
@@ -2315,8 +2323,8 @@ void switch_packet_send( switch_state * s, tw_bf * bf, fattree_message * msg,
   }
   if (input_port == s->radix)
 	  printf("Input port not found!\n");
-  int selected_vl = s->sl2vl[msg->sl * s->radix * s->radix + input_port * s->radix + output_port];
-  msg->saved_vl = selected_vl;
+  int selected_vl = s->sl2vl[cur_entry->msg.sl * s->radix * s->radix + input_port * s->radix + output_port];
+  cur_entry->msg.saved_vl = selected_vl;
 
   tw_lpid next_stop = s->port_connections[output_port];
   int to_terminal = 0;
@@ -3097,6 +3105,16 @@ void fattree_terminal_final( ft_terminal_state * s, tw_lp * lp )
 
     lp_io_write(lp->gid, "fattree-msg-stats", written, s->output_buf);
 
+	written = 0;
+
+    if(!s->terminal_id && !s->rail_id)
+        written = sprintf(s->output_buf, "# Format <LP id> <Terminal ID> <Rail ID> <VL> <Total Data Size Sent>\n");
+    for (int vlnum = 0; vlnum < s->params->num_vl; vlnum++) {
+		written += sprintf(s->output_buf + written, "%llu %u %u %d %lld\n", 
+				LLU(lp->gid), s->terminal_id, s->rail_id, vlnum, s->link_traffic_per_vl[vlnum]);
+	}
+
+    lp_io_write(lp->gid, "fattree-terminal-traffic-pervl", written, s->output_buf);
     if(s->terminal_msgs[0] != NULL)
       printf("[%llu] leftover terminal messages \n", LLU(lp->gid));
     //if(s->packet_gen != s->packet_fin)
@@ -3205,11 +3223,11 @@ void fattree_switch_final(switch_state * s, tw_lp * lp)
     if(!s->switch_id && !s->rail_id)
     {
         written = sprintf(s->output_buf2, "# Format <LP ID> <Rail ID> <Level ID> <Switch ID> <VL num> <Link traffic per switch port(s)>");
-        written += sprintf(s->output_buf2 + written, "# Switch ports: %d, num vls %d",
+        written += sprintf(s->output_buf2 + written, "# Switch ports: %d, num vls %d\n",
             s->radix, num_vls);
     }
     for (int vlnum = 0; vlnum < num_vls; vlnum++) {
-        written += sprintf(s->output_buf2 + written, "\n %llu %d %d %d %d",
+        written += sprintf(s->output_buf2 + written, "%llu %d %d %d %d",
                 LLU(lp->gid),s->rail_id,s->switch_level,s->switch_id, vlnum);
 
         for(int d = 0; d < s->radix; d++)
