@@ -17,13 +17,14 @@
 #include "codes/configuration.h"
 #include "codes/lp-type-lookup.h"
 
-#define PAYLOAD_SZ (512*256)
+#define DEFAULT_PAYLOAD_SZ (512*256)
 
 #define PARAMS_LOG 1
 
 static int net_id = 0;
 static int offset = 2;
 static int traffic = 1;
+static int payload_size = DEFAULT_PAYLOAD_SZ;
 static double arrival_time = 1000.0;
 static double load = 0.0;	//Percent utilization of terminal uplink
 static double MEAN_INTERVAL = 0.0;
@@ -78,7 +79,8 @@ enum TRAFFIC
         RANK_ZERO = 3, /* Send all traffic to rank 0 */
         PFISTER = 4, /* A combination of UNIFORM and RANK_ZERO */
         GRID = 5, /* breaks into a cartesian grid and sends to 4 neighbors */
-        UNIFORM_NN = 6
+        UNIFORM_NN = 6,
+        CSTENCIL = 7
 
 };
 enum TRAFFIC_MAP {
@@ -214,8 +216,9 @@ void ft_svr_register_model_stats()
 const tw_optdef app_opt [] =
 {
         TWOPT_GROUP("Model net synthetic traffic " ),
-	TWOPT_UINT("traffic", traffic, "UNIFORM RANDOM=1, BISECTION=2, TO_RANK_0=3, PFISTER=4, GRID=5. Add 1000 to 4, 5 for a different mapping."),
+	TWOPT_UINT("traffic", traffic, "UNIFORM RANDOM=1, BISECTION=2, TO_RANK_0=3, PFISTER=4, GRID=5, CSTENCIL=7. Add 1000 to 4, 5 for a different mapping."),
     	TWOPT_UINT("num_messages", num_msgs, "Number of messages to be generated per terminal "),
+    	TWOPT_UINT("payload_sz", payload_size, "Size in bytes of each message to generate"),
 	TWOPT_STIME("arrival_time", arrival_time, "INTER-ARRIVAL TIME"),
         TWOPT_STIME("load", load, "percentage of terminal link bandiwdth to inject packets"),
         TWOPT_END()
@@ -274,7 +277,7 @@ static void issue_event(
 //    kickoff_time = 1.1 * g_tw_lookahead + tw_rand_exponential(lp->rng, arrival_time);
     kickoff_time = g_tw_lookahead + tw_rand_exponential(lp->rng, MEAN_INTERVAL);
     if (extra_delay)
-        kickoff_time += bytes_to_ns(PAYLOAD_SZ, load*this_link_bandwidth);
+        kickoff_time += bytes_to_ns(payload_size, load*this_link_bandwidth);
 
 
     e = tw_event_new(lp->gid, kickoff_time, lp);
@@ -459,8 +462,24 @@ static void handle_kickoff_event(
         case BISECTION:
             {
                 local_dest = (local_id + num_nodes/2) % num_nodes;
-                if (traffic / MAP_SCALE != REGULAR)
-                    local_dest = rand_node_map[local_dest];
+                if (traffic / MAP_SCALE == RANDOM) {
+                    // Use random permutation to map first half to second half
+                    // and so that if x sends to y, then y also sends to x.
+                    // The way rand_node_map and rand_node_reverse_map are constructed
+                    // means that these loops should terminate
+                    if (local_id < num_nodes/2) {
+                        local_dest = local_id;
+                        do {
+                            local_dest = rand_node_map[local_dest];
+                        } while (local_dest >= num_nodes / 2);
+                        local_dest += num_nodes/2;
+                    } else {
+                        local_dest = local_id - num_nodes/2;
+                        do {
+                            local_dest = rand_node_reverse_map[local_dest];
+                        } while (local_dest >= num_nodes / 2);
+                    }
+                }
             }
             break;
         case PFISTER:
@@ -575,6 +594,28 @@ static void handle_kickoff_event(
                     while(local_dest != local_id && __builtin_popcount(local_dest*local_dest) % 2 == 0);
                 }
             }
+        case CSTENCIL:
+            {
+                assert(num_nodes == 3072);
+                int dims[3] = {16, 16, 12};
+                int direction = (ns->msg_sent_count) % 6;
+                int pos[3] = {0, 0, 0};
+                int src = local_id;
+                for (int i = 0; i < 3; i++) {
+                    pos[i] = src % dims[i];
+                    src /= dims[i];
+                }
+                int delta = 2*(direction % 2) - 1;
+                pos[direction / 2] = (pos[direction / 2] + delta + dims[direction/2]) % dims[direction/2];
+
+                int scale = 1;
+                local_dest = 0;
+                for (int i = 0; i < 3; i++) {
+                    local_dest += pos[i] * scale;
+                    scale *= dims[i];
+                }
+
+            }
                 
 
     }
@@ -596,7 +637,7 @@ static void handle_kickoff_event(
 
    ns->msg_sent_count++;
 
-   m->event_rc = model_net_event(net_id, "test", global_dest, PAYLOAD_SZ, 0.0, sizeof(svr_msg), (const void*)m_remote, sizeof(svr_msg), (const void*)m_local, lp);
+   m->event_rc = model_net_event(net_id, "test", global_dest, payload_size, 0.0, sizeof(svr_msg), (const void*)m_remote, sizeof(svr_msg), (const void*)m_local, lp);
 
    //printf("LP:%d localID:%d Here\n",(int)lp->gid, (int)local_dest);
    //printf("Just Checking net_id:%d\n",net_id);
@@ -634,6 +675,9 @@ static void handle_remote_event(
                 issue_event(ns, lp, false);
         }
     } 
+    else if (traffic % 1000 == CSTENCIL)
+    {
+    }
     else {
         tw_event *e;
         e = tw_event_new(m->src, .01, lp);
@@ -688,7 +732,7 @@ static void handle_local_event(
     (void)m;
     (void)lp;
     ns->local_recvd_count++;
-    if (traffic % 1000 == GRID) {
+    if (traffic % 1000 == GRID || traffic % 1000 == CSTENCIL) {
         issue_event(ns, lp, false);
     }
 }
