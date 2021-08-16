@@ -69,7 +69,7 @@ int main(
   
     if((NUM_SERVERS + NUM_CLIENTS) % nprocs)
     {
-        fprintf(stderr, "Error: number of server LPs (%d total) is not evenly divisible by the number of MPI processes (%d)\n", NUM_SERVERS+NUM_CLIENTS, nprocs);
+        fprintf(stderr, "Error: number of server (or nw-lp) LPs (%d total) is not evenly divisible by the number of MPI processes (%d)\n", NUM_SERVERS+NUM_CLIENTS, nprocs);
         exit(-1);
     }
 
@@ -106,7 +106,7 @@ int main(
        return(-1); 
     }
 
-    struct codes_workload_method dummy_method = {"foo", NULL, NULL, NULL, NULL, NULL};
+    struct codes_workload_method dummy_method = {"foo", NULL, NULL, NULL, NULL, NULL, NULL, NULL};
     codes_workload_add_method(&dummy_method);
 
     workload_set_params();

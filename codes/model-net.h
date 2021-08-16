@@ -66,6 +66,7 @@ typedef struct mn_stats mn_stats;
     X(SIMPLEP2P, "modelnet_simplep2p", "simplep2p", &simplep2p_method)\
     X(TORUS,     "modelnet_torus",     "torus",     &torus_method)\
     X(SLIMFLY,   "modelnet_slimfly",   "slimfly",   &slimfly_method)\
+    X(SLIMFLY_ROUTER, "modelnet_slimfly_router", "slimfly_router", &slimfly_router_method)\
     X(FATTREE,   "modelnet_fattree",   "fattree",   &fattree_method)\
     X(DRAGONFLY, "modelnet_dragonfly", "dragonfly", &dragonfly_method)\
     X(DRAGONFLY_ROUTER, "modelnet_dragonfly_router", "dragonfly_router", &dragonfly_router_method)\
@@ -133,6 +134,10 @@ typedef struct model_net_request {
     int      remote_event_size;
     int      self_event_size;
     char     category[CATEGORY_NAME_MAX];
+
+    //for counting msg app id
+    int     app_id;
+
 } model_net_request;
 
 /* data structure for tracking network statistics */

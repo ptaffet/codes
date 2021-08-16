@@ -46,6 +46,12 @@ static char group_name[MAX_NAME_LENGTH];
 static char lp_type_name[MAX_NAME_LENGTH];
 static int group_index, lp_type_index, rep_id, offset;
 
+/* statistic values for final output */
+static tw_stime max_global_server_latency = 0.0;
+static tw_stime sum_global_server_latency = 0.0;
+static long long sum_global_messages_received = 0;
+static tw_stime mean_global_server_latency = 0.0;
+
 /* type of events */
 enum svr_event
 {
@@ -72,13 +78,19 @@ struct svr_state
     int local_recvd_count; /* number of local messages received */
     tw_stime start_ts;    /* time that we started sending requests */
     tw_stime end_ts;      /* time that we ended sending requests */
+    int svr_id;
     int dest_id;
+
+    tw_stime max_server_latency; /* maximum measured packet latency observed by server */
+    tw_stime sum_server_latency; /* running sum of measured latencies observed by server for calc of mean */
 };
 
 struct svr_msg
 {
     enum svr_event svr_event_type;
     tw_lpid src;          /* source of this request or ack */
+    tw_stime msg_start_time;
+    tw_stime saved_time; /* helper for reverse computation */
     int incremented_flag; /* helper for reverse computation */
     model_net_event_return event_rc;
 };
@@ -206,6 +218,9 @@ static void svr_init(
 {
     ns->start_ts = 0.0;
     ns->dest_id = -1;
+    ns->svr_id = codes_mapping_get_lp_relative_id(lp->gid, 0, 0);
+    ns->max_server_latency = 0.0;
+    ns->sum_server_latency = 0.0;
 
     issue_event(ns, lp);
     return;
@@ -256,6 +271,7 @@ static void handle_kickoff_event(
 
     m_local->svr_event_type = LOCAL;
     m_local->src = lp->gid;
+    m_local->msg_start_time = tw_now(lp);
 
     memcpy(m_remote, m_local, sizeof(svr_msg));
     m_remote->svr_event_type = REMOTE;
@@ -269,7 +285,8 @@ static void handle_kickoff_event(
    if(traffic == UNIFORM)
    {
     b->c1 = 1;
-   	local_dest = tw_rand_integer(lp->rng, 0, num_nodes - 1);
+    local_dest = tw_rand_integer(lp->rng, 1, num_nodes - 2);
+    local_dest = (ns->svr_id + local_dest) % num_nodes;
    }
    else if(traffic == NEAREST_GROUP)
    {
@@ -311,7 +328,7 @@ static void handle_kickoff_event(
         int rand_node_intra_id = tw_rand_integer(lp->rng, 0, num_nodes_per_grp-1);
 
         local_dest = (rand_group * num_nodes_per_grp) + rand_node_intra_id;
-        printf("\n LP %ld sending to %ld num nodes %d ", local_id, local_dest, num_nodes);
+        printf("\n LP %d sending to %llu num nodes %llu ", local_id, LLU(local_dest), num_nodes);
 
    }
    assert(local_dest < num_nodes);
@@ -334,6 +351,11 @@ static void handle_remote_rev_event(
         (void)m;
         (void)lp;
         ns->msg_recvd_count--;
+
+        tw_stime packet_latency = tw_now(lp) - m->msg_start_time;
+        ns->sum_server_latency -= packet_latency;
+        if (b->c2)
+            ns->max_server_latency = m->saved_time;
 }
 
 static void handle_remote_event(
@@ -346,6 +368,15 @@ static void handle_remote_event(
         (void)m;
         (void)lp;
 	ns->msg_recvd_count++;
+
+    tw_stime packet_latency = tw_now(lp) - m->msg_start_time;
+    ns->sum_server_latency += packet_latency;
+    if (packet_latency > ns->max_server_latency) {
+        b->c2 = 1;
+        m->saved_time = ns->max_server_latency;
+        ns->max_server_latency = packet_latency;
+    }
+
 }
 
 static void handle_local_rev_event(
@@ -371,11 +402,6 @@ static void handle_local_event(
         (void)lp;
     ns->local_recvd_count++;
 }
-/* convert ns to seconds */
-static tw_stime ns_to_s(tw_stime ns)
-{
-    return(ns / (1000.0 * 1000.0 * 1000.0));
-}
 
 /* convert seconds to ns */
 static tw_stime s_to_ns(tw_stime ns)
@@ -388,6 +414,18 @@ static void svr_finalize(
     tw_lp * lp)
 {
     ns->end_ts = tw_now(lp);
+
+    //add to the global running sums
+    sum_global_server_latency += ns->sum_server_latency;
+    sum_global_messages_received += ns->msg_recvd_count;
+
+    //compare to global maximum
+    if (ns->max_server_latency > max_global_server_latency)
+        max_global_server_latency = ns->max_server_latency;
+
+    //this server's mean
+    // tw_stime mean_packet_latency = ns->sum_server_latency/ns->msg_recvd_count;
+
 
     //printf("server %llu recvd %d bytes in %f seconds, %f MiB/s sent_count %d recvd_count %d local_count %d \n", (unsigned long long)lp->gid, PAYLOAD_SZ*ns->msg_recvd_count, ns_to_s(ns->end_ts-ns->start_ts),
     //    ((double)(PAYLOAD_SZ*ns->msg_sent_count)/(double)(1024*1024)/ns_to_s(ns->end_ts-ns->start_ts)), ns->msg_sent_count, ns->msg_recvd_count, ns->local_recvd_count);
@@ -441,6 +479,26 @@ static void svr_event(
     }
 }
 
+// does MPI reduces across PEs to generate stats based on the global static variables in this file
+static void svr_report_stats()
+{
+    long long total_received_messages;
+    tw_stime total_sum_latency, max_latency, mean_latency;
+    
+
+    MPI_Reduce( &sum_global_messages_received, &total_received_messages, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_CODES);
+    MPI_Reduce( &sum_global_server_latency, &total_sum_latency, 1,MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_CODES);
+    MPI_Reduce( &max_global_server_latency, &max_latency, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_CODES);
+
+    mean_latency = total_sum_latency / total_received_messages;
+
+    if(!g_tw_mynode)
+    {	
+        printf("\nSynthetic Workload LP Stats: Mean Message Latency: %lf us,  Maximum Message Latency: %lf us,  Total Messages Received: %lld\n",
+                (float)mean_latency / 1000, (float)max_latency / 1000, total_received_messages);
+    }
+}
+
 int main(
     int argc,
     char **argv)
@@ -449,7 +507,6 @@ int main(
     int rank;
     int num_nets;
     int *net_ids;
-    int num_router_rows, num_router_cols;
 
     tw_opt_add(app_opt);
     tw_init(&argc, &argv);
@@ -491,12 +548,15 @@ int main(
     }
     num_servers_per_rep = codes_mapping_get_lp_count("MODELNET_GRP", 1, "nw-lp",
             NULL, 1);
-    configuration_get_value_int(&config, "PARAMS", "num_router_rows", NULL, &num_router_rows);
-    configuration_get_value_int(&config, "PARAMS", "num_router_cols", NULL, &num_router_cols);
+
+    int num_routers;
+
+    configuration_get_value_int(&config, "PARAMS", "num_routers", NULL, &num_routers);
+
     configuration_get_value_int(&config, "PARAMS", "num_groups", NULL, &num_groups);
     configuration_get_value_int(&config, "PARAMS", "num_cns_per_router", NULL, &num_nodes_per_cn);
 
-    num_routers_per_grp = num_router_rows * num_router_cols;
+    num_routers_per_grp = num_routers;
 
     num_nodes = num_groups * num_routers_per_grp * num_nodes_per_cn;
     num_nodes_per_grp = num_routers_per_grp * num_nodes_per_cn;
@@ -516,6 +576,7 @@ int main(
         assert(ret == 0 || !"lp_io_flush failure");
     }
     model_net_report_stats(net_id);
+    svr_report_stats();
     tw_end();
     return 0;
 }
