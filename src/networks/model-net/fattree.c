@@ -2410,7 +2410,8 @@ void switch_packet_send( switch_state * s, tw_bf * bf, fattree_message * msg,
   m->magic = switch_magic_num;
 
   int increase_traffic_by = 0;
-  if((cur_entry->msg.packet_size % s->params->chunk_size) && (cur_entry->msg.chunk_id == num_chunks - 1)) {
+  // Packet_size == 0 happens with e.g. barrier collective in TraceR
+  if((cur_entry->msg.packet_size == 0 || cur_entry->msg.packet_size % s->params->chunk_size) && (cur_entry->msg.chunk_id == num_chunks - 1)) {
       bf->c11 = 1;
       increase_traffic_by =  (cur_entry->msg.packet_size %
               s->params->chunk_size);
