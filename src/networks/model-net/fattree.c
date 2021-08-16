@@ -25,7 +25,8 @@
 #define FTREE_HASH_TABLE_SIZE 29989
 
 // debugging parameters
-#define TRACK_PKT 388402465
+#define TRACK_PKT 388000000
+#define VLDEBUG 1
 //#define TRACK_PKT 2820
 #define FATTREE_HELLO 0
 #define FATTREE_DEBUG 0
@@ -97,6 +98,14 @@ enum RAIL_SELECTION_ALGO
     RAIL_DEDICATED=1,
     RAIL_ADAPTIVE,
 };
+
+enum LINK_COUNTER_MODE
+{
+	PURE_BANDWIDTH = 0,
+	MIXED = 1
+};
+
+static enum LINK_COUNTER_MODE link_counter_mode = 0;
 static char routing_folder[MAX_NAME_LENGTH];
 static char sl2vl_folder[MAX_NAME_LENGTH];
 static char dot_file_p[MAX_NAME_LENGTH];
@@ -523,6 +532,8 @@ static int read_slmap_terminal(ft_terminal_state *s, tw_lp *lp) {
   s->sl2vl = calloc(expected_entries, sizeof(int));
   s->dest2sl = calloc(s->params->num_terminals, sizeof(int));
 
+  if (sl2vl_folder[0] == '\0')
+	  return 0;
   sprintf(file_name, "%s/0x%016"PRIx64".sl2vl", sl2vl_folder, get_term_guid(s));
   FILE *file = NULL;
   if (!(file = fopen(file_name, "r")))
@@ -556,6 +567,8 @@ static int read_sl2vl_switch(switch_state *s, tw_lp *lp) {
   s->sl2vl = calloc(expected_entries, sizeof(int));
 
   char file_name[512];
+  if (sl2vl_folder[0] == '\0')
+	  return 0;
 
   sprintf(file_name, "%s/0x%016"PRIx64".sl2vl", sl2vl_folder, get_switch_guid(s));
   FILE *file = NULL;
@@ -807,10 +820,8 @@ void post_switch_init(switch_state *s, tw_lp *lp)
   if (s->radix == 0) {
 	  printf("Skipping switch with 0 radix\n");
   }
-  else if (sl2vl_folder[0] != '\0') {
-	  if (0 != read_sl2vl_switch(s, lp)) {
-		  tw_error(TW_LOC, "Error while reading a switch SL2VL table");
-	  }
+  else if (0 != read_sl2vl_switch(s, lp)) {
+	  tw_error(TW_LOC, "Error while reading a switch SL2VL table");
   }
 
 }
@@ -1003,7 +1014,7 @@ static void fattree_read_config(const char * anno, fattree_param *p){
   if(!g_tw_mynode) printf("Random sampling one out of every %d packets for reservoir sampling\n", p->res_sample_freq);
 
 
-  char routing_str[MAX_NAME_LENGTH];
+  char routing_str[MAX_NAME_LENGTH] = {0};
   configuration_get_value(&config, "PARAMS", "routing", anno, routing_str,
       MAX_NAME_LENGTH);
   if(strcmp(routing_str, "static") == 0)
@@ -1016,7 +1027,7 @@ static void fattree_read_config(const char * anno, fattree_param *p){
   }
   if(!g_tw_mynode) printf("FT routing is %d\n", p->routing);
   
-  char rail_select_str[MAX_NAME_LENGTH];
+  char rail_select_str[MAX_NAME_LENGTH] = {0};
   configuration_get_value(&config, "PARAMS", "rail_select", anno, rail_select_str,
       MAX_NAME_LENGTH);
   if(strcmp(rail_select_str, "dedicated") == 0)
@@ -1048,6 +1059,11 @@ static void fattree_read_config(const char * anno, fattree_param *p){
   sl2vl_folder[0] = '\0';
   rc = configuration_get_value(&config, "PARAMS", "sl2vl_folder", anno, sl2vl_folder,
       MAX_NAME_LENGTH);
+
+  link_counter_mode = PURE_BANDWIDTH;
+  configuration_get_value_int(&config, "PARAMS", "link_counter_mode", anno,
+      &link_counter_mode);
+  if(!g_tw_mynode) printf("Using link counter mode %s\n", link_counter_mode==0 ? "0=pure bytes" : "1=mixed");
 
   p->num_sl = 1;
   configuration_get_value_int(&config, "PARAMS", "num_sl", anno,
@@ -1741,7 +1757,10 @@ void ft_packet_generate_rc(ft_terminal_state * s, tw_bf * bf, fattree_message * 
     }
 
     int vl = s->sl2vl[msg->sl];
-    s->link_traffic_per_vl[vl] -= msg->packet_size;
+	if (link_counter_mode == PURE_BANDWIDTH)
+		s->link_traffic_per_vl[vl] -= msg->packet_size;
+	else
+		s->link_traffic_per_vl[vl] -= msg->packet_size/2 + s->params->packet_size/2;
 
     struct mn_stats* stat;
     stat = model_net_find_stats(msg->category, s->fattree_stats_array);
@@ -1786,9 +1805,9 @@ void ft_packet_generate(ft_terminal_state * s, tw_bf * bf, fattree_message * msg
 
 
   msg->packet_ID = lp->gid*100000 + s->packet_counter;
-#if DEBUG
-  if (lp->gid == 3884) {
-	  printf("Generating packet %llu destined for %d at time %f\n", msg->packet_ID, codes_mapping_get_lp_relative_id(msg->final_dest_gid, 0, 0), tw_now(lp));
+#if VLDEBUG
+  if (msg->packet_ID == TRACK_PKT) {
+	  printf("Packet %llu generated: size=%d packet_size=%d\n", msg->packet_ID, msg->packet_size, s->params->packet_size);
   }
 #endif
 
@@ -1810,7 +1829,13 @@ void ft_packet_generate(ft_terminal_state * s, tw_bf * bf, fattree_message * msg
   int dest_term_local_id = codes_mapping_get_lp_relative_id(msg->dest_terminal_id, 0, 0);
   msg->sl = s->dest2sl[dest_term_local_id];
   int vl = s->sl2vl[msg->sl];
-  s->link_traffic_per_vl[vl] += msg->packet_size;
+  msg->saved_vl = vl;
+
+  if (link_counter_mode == PURE_BANDWIDTH)
+	  s->link_traffic_per_vl[vl] += msg->packet_size;
+  else
+	  s->link_traffic_per_vl[vl] += msg->packet_size/2 + s->params->packet_size/2;
+
 
   for(uint64_t i = 0; i < num_chunks; i++)
   {
@@ -2274,6 +2299,8 @@ void switch_packet_send_rc(switch_state * s,
         decrease_traffic_by += s->params->chunk_size;
     }
     s->link_traffic[output_port] -= decrease_traffic_by;
+	if (link_counter_mode == MIXED)
+		decrease_traffic_by = decrease_traffic_by/2 + s->params->packet_size/2;
     s->link_traffic_per_vl[msg->saved_vl * s->radix + output_port] -= decrease_traffic_by;
 
     prepend_to_fattree_message_list(s->pending_msgs,
@@ -2325,6 +2352,7 @@ void switch_packet_send( switch_state * s, tw_bf * bf, fattree_message * msg,
 	  printf("Input port not found!\n");
   int selected_vl = s->sl2vl[cur_entry->msg.sl * s->radix * s->radix + input_port * s->radix + output_port];
   cur_entry->msg.saved_vl = selected_vl;
+  msg->saved_vl = selected_vl;
 
   tw_lpid next_stop = s->port_connections[output_port];
   int to_terminal = 0;
@@ -2391,6 +2419,13 @@ void switch_packet_send( switch_state * s, tw_bf * bf, fattree_message * msg,
     increase_traffic_by = s->params->chunk_size;
   }
   s->link_traffic[output_port] += increase_traffic_by;
+#if VLDEBUG
+  if (cur_entry->msg.packet_ID == TRACK_PKT) {
+	  printf("Packet %llu at a switch: size=%d packet_size=%d increaseby=%d\n", cur_entry->msg.packet_ID, cur_entry->msg.packet_size, s->params->packet_size, increase_traffic_by);
+  }
+#endif
+  if (link_counter_mode == MIXED)
+	  increase_traffic_by = increase_traffic_by/2 + s->params->packet_size/2;
   s->link_traffic_per_vl[selected_vl * s->radix + output_port] += increase_traffic_by;
 
   /* Determine the event type. If the packet has arrived at the final destination
@@ -2949,7 +2984,7 @@ void ft_packet_arrive(ft_terminal_state * s, tw_bf * bf, fattree_message * msg,
 			ft_send_remote_event(s, msg, lp, bf, tmp->remote_event_data, tmp->remote_event_size);
 			if (tmp->remote_event_size == 88) {
 				// Probably a TraceR packet
-				tw_output(lp, "Tag,%d,%" PRIu64 ",%d\n", codes_mapping_get_lp_relative_id(msg->sender_lp, 0, 0), key.message_id, ((int*)tmp->remote_event_data )[11] ); // Pretty sketchy and fragile, but this gets the tag
+				// tw_output(lp, "Tag,%d,%" PRIu64 ",%d\n", codes_mapping_get_lp_relative_id(msg->sender_lp, 0, 0), key.message_id, ((int*)tmp->remote_event_data )[11] ); // Pretty sketchy and fragile, but this gets the tag
 			}
 		}
 		/* Remove the hash entry */
@@ -3220,6 +3255,7 @@ void fattree_switch_final(switch_state * s, tw_lp * lp)
     lp_io_write(lp->gid, "fattree-switch-traffic", written, s->output_buf2);
 
     int num_vls = s->params->num_vl;
+	written = 0;
     if(!s->switch_id && !s->rail_id)
     {
         written = sprintf(s->output_buf2, "# Format <LP ID> <Rail ID> <Level ID> <Switch ID> <VL num> <Link traffic per switch port(s)>");
